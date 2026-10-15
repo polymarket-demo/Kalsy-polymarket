@@ -44,20 +44,19 @@ async function fetchKalshi() {
       + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
     const r = await fetch(url);
     if (!r.ok) {
-      console.error(`[kalshi] HTTP ${r.status} su ${url}`);
+      console.error(`[kalshi] HTTP ${r.status}`);
       break;
     }
     const j = await r.json();
 
     if (primoLog) {
       console.log(`[kalshi] chiavi risposta: ${Object.keys(j).join(",")}`);
-      const arr = j.markets || j.data || [];
+      const arr = j.markets || [];
       console.log(`[kalshi] primo giro: ${arr.length} mercati`);
-      if (arr[0]) console.log(`[kalshi] campi: ${Object.keys(arr[0]).slice(0, 30).join(",")}`);
       primoLog = false;
     }
 
-    const page = j.markets || j.data || [];
+    const page = j.markets || [];
     out.push(...page);
     cursor = j.cursor || "";
     if (!cursor || page.length === 0) break;
@@ -83,7 +82,10 @@ async function fetchKalshi() {
   const conPrezzi = aperti.filter(m => isFinite(m.yesAsk) && isFinite(m.noAsk));
   console.log(`[kalshi] con prezzi validi: ${conPrezzi.length}`);
 
-  const passati = conPrezzi.filter(m => m.yesAsk > 0.02 && m.yesAsk < 0.98);
+  const passati = conPrezzi.filter(m =>
+    (m.yesAsk > 0.01 && m.yesAsk < 0.99) ||
+    (m.noAsk > 0.01 && m.noAsk < 0.99)
+  );
   console.log(`[kalshi] dopo filtro prezzo: ${passati.length}`);
 
   return passati;
@@ -93,8 +95,8 @@ async function fetchPolymarket() {
   const out = [];
   let primoLog = true;
 
-  for (let off = 0; off < 5000; off += 500) {
-    const r = await fetch(`${GAMMA}/markets?closed=false&active=true&limit=500&offset=${off}`);
+  for (let off = 0; off < 5000; off += 100) {
+    const r = await fetch(`${GAMMA}/markets?closed=false&active=true&limit=100&offset=${off}`);
     if (!r.ok) { console.error(`[poly] HTTP ${r.status}`); break; }
     const j = await r.json();
     const page = Array.isArray(j) ? j : j.data || [];
@@ -107,7 +109,7 @@ async function fetchPolymarket() {
     console.log(`[poly] offset ${off}: ${page.length} grezzi`);
     if (!page.length) break;
     out.push(...page);
-    if (page.length < 500) break;
+    if (page.length < 100) break;
   }
 
   console.log(`[poly] scaricati ${out.length} grezzi`);
@@ -162,7 +164,7 @@ async function scanOnce() {
       const s = overlap(km.title, pm.title);
       if (s > bestScore) { bestScore = s; best = pm; }
     }
-    if (!best || bestScore < 0.6) continue;
+    if (!best || bestScore < 0.45) continue;
     accoppiate++;
 
     const [pYes, pNo] = await Promise.all([
@@ -194,7 +196,7 @@ async function scanOnce() {
     }
   }
 
-  console.log(`[scan] coppie accoppiate (soglia 60%): ${accoppiate}`);
+  console.log(`[scan] coppie accoppiate (soglia 45%): ${accoppiate}`);
   hits.sort((a, b) => b.edge - a.edge);
   const top = hits.slice(0, 100);
   console.log(`[scan] coppie con somma < 1.00: ${hits.length}`);
