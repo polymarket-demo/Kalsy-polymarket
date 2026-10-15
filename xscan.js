@@ -11,7 +11,6 @@ const KALSHI = "https://external-api.kalshi.com/trade-api/v2";
 const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB = "https://clob.polymarket.com";
 
-// parole da ignorare nell'accoppiamento dei titoli
 const STOP = new Set([
   "will","the","a","an","in","on","of","to","be","is","are","by","at",
   "for","and","or","before","after","end","yes","no","market","win",
@@ -38,20 +37,35 @@ function overlap(a, b) {
 async function fetchKalshi() {
   const out = [];
   let cursor = "";
-  for (let i = 0; i < 8; i++) {
-    const url = `${KALSHI}/markets?status=open&limit=1000`
+  let primoLog = true;
+
+  for (let i = 0; i < 10; i++) {
+    const url = `${KALSHI}/markets?limit=1000`
       + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
     const r = await fetch(url);
     if (!r.ok) {
-      console.error(`[kalshi] HTTP ${r.status}`);
+      console.error(`[kalshi] HTTP ${r.status} su ${url}`);
       break;
     }
     const j = await r.json();
-    out.push(...(j.markets || []));
+
+    if (primoLog) {
+      console.log(`[kalshi] chiavi risposta: ${Object.keys(j).join(",")}`);
+      const arr = j.markets || j.data || [];
+      console.log(`[kalshi] primo giro: ${arr.length} mercati`);
+      if (arr[0]) console.log(`[kalshi] campi: ${Object.keys(arr[0]).slice(0, 30).join(",")}`);
+      primoLog = false;
+    }
+
+    const page = j.markets || j.data || [];
+    out.push(...page);
     cursor = j.cursor || "";
-    if (!cursor) break;
+    if (!cursor || page.length === 0) break;
   }
-  return out.map(m => ({
+
+  console.log(`[kalshi] scaricati ${out.length} grezzi`);
+
+  const mapped = out.map(m => ({
     src: "kalshi",
     id: m.ticker,
     title: m.title || m.yes_sub_title || m.ticker,
@@ -59,39 +73,65 @@ async function fetchKalshi() {
     noAsk: parseFloat(m.no_ask_dollars),
     vol: parseFloat(m.volume_fp || 0),
     closeTime: m.close_time,
+    status: m.status,
     rules: (m.rules_primary || "").slice(0, 400),
-  })).filter(m =>
-    isFinite(m.yesAsk) && isFinite(m.noAsk) &&
-    m.yesAsk > 0.02 && m.yesAsk < 0.98 && m.vol > 1000
-  );
+  }));
+
+  const aperti = mapped.filter(m => m.status === "open" || m.status === "active" || !m.status);
+  console.log(`[kalshi] aperti: ${aperti.length}`);
+
+  const conPrezzi = aperti.filter(m => isFinite(m.yesAsk) && isFinite(m.noAsk));
+  console.log(`[kalshi] con prezzi validi: ${conPrezzi.length}`);
+
+  const passati = conPrezzi.filter(m => m.yesAsk > 0.02 && m.yesAsk < 0.98);
+  console.log(`[kalshi] dopo filtro prezzo: ${passati.length}`);
+
+  return passati;
 }
 
 async function fetchPolymarket() {
   const out = [];
-  for (let off = 0; off < 4000; off += 500) {
+  let primoLog = true;
+
+  for (let off = 0; off < 5000; off += 500) {
     const r = await fetch(`${GAMMA}/markets?closed=false&active=true&limit=500&offset=${off}`);
-    if (!r.ok) break;
+    if (!r.ok) { console.error(`[poly] HTTP ${r.status}`); break; }
     const j = await r.json();
     const page = Array.isArray(j) ? j : j.data || [];
+
+    if (primoLog && page[0]) {
+      console.log(`[poly] campi: ${Object.keys(page[0]).slice(0, 30).join(",")}`);
+      primoLog = false;
+    }
+
+    console.log(`[poly] offset ${off}: ${page.length} grezzi`);
     if (!page.length) break;
     out.push(...page);
     if (page.length < 500) break;
   }
-  return out
-    .filter(m => m.acceptingOrders === true)
-    .map(m => {
-      let tok = [];
-      try { tok = JSON.parse(m.clobTokenIds || "[]"); } catch {}
-      return {
-        src: "poly",
-        id: m.conditionId,
-        title: m.question,
-        yesToken: tok[0],
-        noToken: tok[1],
-        vol: parseFloat(m.volumeNum || 0),
-      };
-    })
-    .filter(m => m.yesToken && m.noToken && m.vol > 1000);
+
+  console.log(`[poly] scaricati ${out.length} grezzi`);
+
+  const aperti = out.filter(m => m.acceptingOrders === true);
+  console.log(`[poly] aperti: ${aperti.length}`);
+
+  const mapped = aperti.map(m => {
+    let tok = [];
+    try { tok = JSON.parse(m.clobTokenIds || "[]"); } catch {}
+    return {
+      src: "poly",
+      id: m.conditionId,
+      title: m.question,
+      yesToken: tok[0],
+      noToken: tok[1],
+      vol: parseFloat(m.volumeNum || 0),
+    };
+  });
+
+  const conToken = mapped.filter(m => m.yesToken && m.noToken);
+  console.log(`[poly] con token: ${conToken.length}`);
+
+  return conToken;
 }
 
 async function polyAsk(tokenId) {
@@ -111,18 +151,19 @@ async function polyAsk(tokenId) {
 
 async function scanOnce() {
   const [k, p] = await Promise.all([fetchKalshi(), fetchPolymarket()]);
-  console.log(`[scan] Kalshi ${k.length} mercati | Polymarket ${p.length} mercati`);
+  console.log(`[scan] Kalshi utilizzabili ${k.length} | Polymarket utilizzabili ${p.length}`);
 
   const hits = [];
+  let accoppiate = 0;
 
   for (const km of k) {
-    // accoppio per similarita' di titolo
     let best = null, bestScore = 0;
     for (const pm of p) {
       const s = overlap(km.title, pm.title);
       if (s > bestScore) { bestScore = s; best = pm; }
     }
     if (!best || bestScore < 0.6) continue;
+    accoppiate++;
 
     const [pYes, pNo] = await Promise.all([
       polyAsk(best.yesToken),
@@ -130,11 +171,8 @@ async function scanOnce() {
     ]);
     if (pYes === null || pNo === null) continue;
 
-    // Leg A: compro YES su Kalshi, NO su Polymarket
     const costA = km.yesAsk + pNo;
-    // Leg B: compro NO su Kalshi, YES su Polymarket
     const costB = km.noAsk + pYes;
-
     const cost = Math.min(costA, costB);
     const leg = costA <= costB ? "K_YES + P_NO" : "K_NO + P_YES";
 
@@ -156,9 +194,9 @@ async function scanOnce() {
     }
   }
 
+  console.log(`[scan] coppie accoppiate (soglia 60%): ${accoppiate}`);
   hits.sort((a, b) => b.edge - a.edge);
   const top = hits.slice(0, 100);
-
   console.log(`[scan] coppie con somma < 1.00: ${hits.length}`);
 
   if (top.length) {
@@ -189,18 +227,12 @@ async function scanOnce() {
     const { error } = await supabase.from("signals").insert(rows);
     if (error) throw new Error(`insert: ${error.message}`);
     console.log(`[scan] scritte ${rows.length} righe`);
+  } else {
+    console.log(`[scan] nessuna riga da scrivere`);
   }
-
-  top.slice(0, 10).forEach(h => {
-    console.log(`  ${(h.edge * 100).toFixed(2)}% | ${h.leg} | ${h.kalshi_title} | ${h.poly_title}`);
-  });
 }
 
 (async () => {
-  try {
-    await scanOnce();
-  } catch (e) {
-    console.error("errore:", e);
-    process.exit(1);
-  }
+  try { await scanOnce(); }
+  catch (e) { console.error("errore:", e); process.exit(1); }
 })();
