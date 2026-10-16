@@ -16,7 +16,7 @@ const DURATA_MIN = 70;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ── Trova il round APPENA iniziato (salta quelli gia' avviati) ──────────
+// ── Trova il round APPENA iniziato ──────────────────────────────────────
 async function trovaMercato() {
   const now = Math.floor(Date.now() / 1000);
   const base = Math.floor(now / 300) * 300;
@@ -41,15 +41,16 @@ async function trovaMercato() {
 
     const iUp = outs.findIndex(o => /up/i.test(o));
     const iDn = outs.findIndex(o => /down/i.test(o));
+    const condId = m.conditionId;
     const fine = new Date(m.endDate).getTime();
     const manca = (fine - Date.now()) / 60000;
 
-    // accetta solo il round APPENA iniziato (tra 4.6 e 5.4 minuti rimanenti)
-    if (manca < 4.6 || manca > 5.4) continue;
+    // finestra piu' larga: non scarta un round per mezzo secondo
+    if (manca < 4.3 || manca > 5.6) continue;
 
     console.log(`[gamma] ROUND ${m.slug} | chiude tra ${manca.toFixed(1)}'`);
     return {
-      slug: m.slug, question: m.question, fine, conditionId: m.conditionId,
+      slug: m.slug, question: m.question, fine, conditionId: condId,
       upToken: tok[iUp >= 0 ? iUp : 0],
       downToken: tok[iDn >= 0 ? iDn : 1],
     };
@@ -79,9 +80,8 @@ async function book(tokenId) {
   } catch { return null; }
 }
 
-// ── Esito ufficiale letto da Gamma ──────────────────────────────────────
+// ── Esito ufficiale da Gamma ────────────────────────────────────────────
 async function esitoDaGamma(conditionId, slug) {
-  // 1) prova con l'evento
   try {
     const r = await fetch(`${GAMMA}/events?slug=${slug}`);
     if (r.ok) {
@@ -89,10 +89,8 @@ async function esitoDaGamma(conditionId, slug) {
       const evs = Array.isArray(j) ? j : j.data || [];
       const m = ((evs[0] || {}).markets || [])[0];
       if (m) {
-        // outcomePrices e' tipo "[\"1\", \"0\"]" → il primo e' UP, il secondo DOWN
-        let prices = [];
+        let prices = [], outs = [];
         try { prices = JSON.parse(m.outcomePrices || "[]"); } catch {}
-        let outs = [];
         try { outs = JSON.parse(m.outcomes || "[]"); } catch {}
         if (prices.length === 2 && outs.length === 2) {
           const iUp = outs.findIndex(o => /up/i.test(o));
@@ -107,7 +105,6 @@ async function esitoDaGamma(conditionId, slug) {
     }
   } catch {}
 
-  // 2) fallback: chiedi il mercato per conditionId
   if (conditionId) {
     try {
       const r = await fetch(`${GAMMA}/markets?condition_ids=${conditionId}`);
@@ -116,9 +113,8 @@ async function esitoDaGamma(conditionId, slug) {
         const arr = Array.isArray(j) ? j : j.data || [];
         const m = arr[0];
         if (m) {
-          let prices = [];
+          let prices = [], outs = [];
           try { prices = JSON.parse(m.outcomePrices || "[]"); } catch {}
-          let outs = [];
           try { outs = JSON.parse(m.outcomes || "[]"); } catch {}
           if (prices.length === 2 && outs.length === 2) {
             const iUp = outs.findIndex(o => /up/i.test(o));
@@ -140,12 +136,11 @@ async function esitoDaGamma(conditionId, slug) {
 async function registraRound(mkt) {
   console.log(`\n=== ${mkt.slug} | ${mkt.question} ===`);
 
-  let lettureOk = 0;
-  let lettureVuote = 0;      // book risposto ma vuoto
-  let lettureErrore = 0;     // fetch fallita
-  let upTocco = null;
-  let dnTocco = null;
+  let lettureOk = 0, lettureVuote = 0, lettureErrore = 0;
+  let upTocco = null, dnTocco = null;
   let minUp = 99, minDn = 99;
+  // traccia la discesa del lato comprato (per lo stop)
+  let mio35 = null, mio30 = null;
 
   while (Date.now() < mkt.fine) {
     const rem = Math.max(0, (mkt.fine - Date.now()) / 60000);
@@ -169,6 +164,15 @@ async function registraRound(mkt) {
         console.log(`  DOWN tocca ${SOGLIA} a ${rem.toFixed(2)}' (ask ${bDn.ask}, size ${bDn.size47.toFixed(0)})`);
       }
 
+      // se solo UN lato e' toccato, traccia la discesa di quel lato
+      if (!(upTocco && dnTocco)) {
+        const mioPx = upTocco ? bUp.ask : (dnTocco ? bDn.ask : null);
+        if (mioPx !== null) {
+          if (mio35 === null && mioPx <= 0.35) mio35 = rem;
+          if (mio30 === null && mioPx <= 0.30) mio30 = rem;
+        }
+      }
+
       if (lettureOk % 40 === 1) {
         console.log(`  rem ${rem.toFixed(1)}' | UP ${bUp.ask} | DN ${bDn.ask} | ok ${lettureOk} vuote ${lettureVuote}`);
       }
@@ -176,10 +180,8 @@ async function registraRound(mkt) {
     await sleep(POLL_MS);
   }
 
-  // ── esito ufficiale ──
   const vincitore = await esitoDaGamma(mkt.conditionId, mkt.slug);
 
-  // ── chi ha toccato per primo ──
   let primo = null, salitoDiretto = null;
   if (upTocco && dnTocco) primo = upTocco.rem > dnTocco.rem ? "UP" : "DOWN";
   else if (upTocco) { primo = "UP"; salitoDiretto = "DOWN"; }
@@ -198,13 +200,18 @@ async function registraRound(mkt) {
   console.log(`    PRIMO: ${primo || "nessuno"}${salitoDiretto ? ` | ${salitoDiretto} è SALITO senza scendere` : ""}`);
   console.log(`    ESITO: ${esito}${costo ? " | costo " + costo.toFixed(2) + " | PnL " + (1 - costo).toFixed(2) : ""}`);
   console.log(`    VINCE: ${vincitore}`);
+  if (esito === "UN_LATO") {
+    console.log(`    STOP: sotto 0.35 a ${mio35 === null ? "MAI" : mio35.toFixed(2) + "'"} | sotto 0.30 a ${mio30 === null ? "MAI" : mio30.toFixed(2) + "'"}`);
+  }
   if (mioLato && ioVinto !== null) console.log(`    IL MIO LATO (${mioLato}) → ${ioVinto ? "VINTO" : "PERSO"}`);
   console.log(`<<<\n`);
 
   return {
     slug: mkt.slug, question: mkt.question, esito, costo,
     upTocco, dnTocco, primo, salitoDiretto, vincitore, mioLato, ioVinto,
-    lettureOk, lettureVuote, lettureErrore, minUp: minUp === 99 ? null : minUp, minDn: minDn === 99 ? null : minDn,
+    lettureOk, lettureVuote, lettureErrore,
+    minUp: minUp === 99 ? null : minUp, minDn: minDn === 99 ? null : minDn,
+    mio35, mio30,
   };
 }
 
@@ -217,14 +224,15 @@ async function registraRound(mkt) {
   while (Date.now() < fine) {
     const mkt = await trovaMercato();
     if (!mkt) {
-      const now = Math.floor(Date.now() / 1000);
-      const prox = (Math.floor(now / 300) + 1) * 300 + 3;
-      const attesa = Math.max(3000, (prox - now) * 1000);
-      console.log(`[main] nessun round appena iniziato, attendo ${(attesa / 1000).toFixed(0)}s`);
+      // aspetta il PROSSIMO round con 5 secondi di margine
+      const now = Date.now();
+      const prox = (Math.floor(now / 300000) + 1) * 300000 + 5000;
+      const attesa = Math.max(2000, prox - now);
+      console.log(`[main] attendo ${(attesa / 1000).toFixed(0)}s il prossimo round`);
       await sleep(attesa);
       continue;
     }
-    if (fatti.has(mkt.slug)) { await sleep(15000); continue; }
+    if (fatti.has(mkt.slug)) { await sleep(10000); continue; }
 
     try {
       const r = await registraRound(mkt);
@@ -234,14 +242,14 @@ async function registraRound(mkt) {
       await supabase.from("signals").insert([{
         category: "btc-maker-test",
         market_title: r.slug,
-        condition_id: r.conditionId || null,
+        condition_id: mkt.conditionId || null,
         signal_type: r.esito,
         detail: JSON.stringify({
           up: r.upTocco, dn: r.dnTocco, costo: r.costo,
           primo: r.primo, salitoDiretto: r.salitoDiretto,
           vince: r.vincitore, mioLato: r.mioLato, ioVinto: r.ioVinto,
           lettureOk: r.lettureOk, lettureVuote: r.lettureVuote, lettureErrore: r.lettureErrore,
-          minUp: r.minUp, minDn: r.minDn,
+          minUp: r.minUp, minDn: r.minDn, stop35: r.mio35, stop30: r.mio30,
         }),
         edge: r.costo ? +(1 - r.costo).toFixed(4) : null,
         live: r.esito === "COPPIA",
@@ -250,22 +258,23 @@ async function registraRound(mkt) {
       console.error("errore round:", e.message);
     }
 
-    const now = Math.floor(Date.now() / 1000);
-    const prox = (Math.floor(now / 300) + 1) * 300 + 3;
-    await sleep(Math.max(2000, (prox - now) * 1000));
+    // allinea al prossimo round
+    const now = Date.now();
+    const prox = (Math.floor(now / 300000) + 1) * 300000 + 5000;
+    await sleep(Math.max(2000, prox - now));
   }
 
-  // ── RIEPILOGO FINALE ──
+  // ── RIEPILOGO ──
   const coppie = risultati.filter(r => r.esito === "COPPIA");
   const unLato = risultati.filter(r => r.esito === "UN_LATO");
   const vinti = unLato.filter(r => r.ioVinto === true).length;
-  const pnl = coppie.reduce((t, r) => t + (1 - r.costo), 0);
+  const conStop = unLato.filter(r => r.mio35 !== null).length;
+  const pnlCoppie = coppie.reduce((t, r) => t + (1 - r.costo), 0);
   const costoMedio = coppie.length ? coppie.reduce((t, r) => t + r.costo, 0) / coppie.length : 0;
 
   console.log(`\n════ RIEPILOGO FINALE ════`);
   console.log(`round registrati: ${risultati.length}`);
-  console.log(`COPPIA:  ${coppie.length} | costo medio ${costoMedio.toFixed(3)} | PnL medio ${coppie.length ? (pnl / coppie.length).toFixed(3) : "-"} | PnL totale ${pnl.toFixed(2)}`);
-  console.log(`UN_LATO: ${unLato.length} | di cui il lato comprato ha vinto: ${vinti}`);
+  console.log(`COPPIA:  ${coppie.length} | costo medio ${costoMedio.toFixed(3)} | PnL medio ${coppie.length ? (pnlCoppie / coppie.length).toFixed(3) : "-"} | totale ${pnlCoppie.toFixed(2)}`);
+  console.log(`UN_LATO: ${unLato.length} | vinti: ${vinti} | con discesa sotto 0.35: ${conStop}`);
   console.log(`NIENTE_LETTURE: ${risultati.filter(r => r.esito === "NIENTE_LETTURE").length}`);
-  console.log(`TOTALE round: ${risultati.length}`);
 })();
