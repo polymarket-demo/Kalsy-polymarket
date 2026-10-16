@@ -45,8 +45,9 @@ async function trovaMercato() {
     const fine = new Date(m.endDate).getTime();
     const manca = (fine - Date.now()) / 60000;
 
-    // finestra piu' larga: non scarta un round per mezzo secondo
-    if (manca < 4.3 || manca > 5.6) continue;
+    // finestra larga: accetta il round appena partito (fino a 5.8') e non
+    // scarta nulla per mezzo secondo di scarto
+    if (manca < 4.3 || manca > 5.8) continue;
 
     console.log(`[gamma] ROUND ${m.slug} | chiude tra ${manca.toFixed(1)}'`);
     return {
@@ -139,8 +140,7 @@ async function registraRound(mkt) {
   let lettureOk = 0, lettureVuote = 0, lettureErrore = 0;
   let upTocco = null, dnTocco = null;
   let minUp = 99, minDn = 99;
-  // traccia la discesa del lato comprato (per lo stop)
-  let mio35 = null, mio30 = null;
+  let mio35 = null, mio30 = null;   // discesa del lato comprato (per lo stop)
 
   while (Date.now() < mkt.fine) {
     const rem = Math.max(0, (mkt.fine - Date.now()) / 60000);
@@ -164,7 +164,6 @@ async function registraRound(mkt) {
         console.log(`  DOWN tocca ${SOGLIA} a ${rem.toFixed(2)}' (ask ${bDn.ask}, size ${bDn.size47.toFixed(0)})`);
       }
 
-      // se solo UN lato e' toccato, traccia la discesa di quel lato
       if (!(upTocco && dnTocco)) {
         const mioPx = upTocco ? bUp.ask : (dnTocco ? bDn.ask : null);
         if (mioPx !== null) {
@@ -223,16 +222,14 @@ async function registraRound(mkt) {
 
   while (Date.now() < fine) {
     const mkt = await trovaMercato();
+
     if (!mkt) {
-      // aspetta il PROSSIMO round con 5 secondi di margine
-      const now = Date.now();
-      const prox = (Math.floor(now / 300000) + 1) * 300000 + 5000;
-      const attesa = Math.max(2000, prox - now);
-      console.log(`[main] attendo ${(attesa / 1000).toFixed(0)}s il prossimo round`);
-      await sleep(attesa);
+      // prova di nuovo tra pochi secondi: il round potrebbe non essere ancora
+      // visibile su Gamma (compare qualche secondo dopo il cambio di 5 minuti)
+      await sleep(4000);
       continue;
     }
-    if (fatti.has(mkt.slug)) { await sleep(10000); continue; }
+    if (fatti.has(mkt.slug)) { await sleep(4000); continue; }
 
     try {
       const r = await registraRound(mkt);
@@ -258,10 +255,11 @@ async function registraRound(mkt) {
       console.error("errore round:", e.message);
     }
 
-    // allinea al prossimo round
-    const now = Date.now();
-    const prox = (Math.floor(now / 300000) + 1) * 300000 + 5000;
-    await sleep(Math.max(2000, prox - now));
+    // ── IL FIX DEL SALTO ──
+    // NON aspettare il prossimo multiplo di 5 minuti: il round dopo e'
+    // appena iniziato (siamo a pochi secondi dalla chiusura del precedente).
+    // Basta una pausa breve e il while successivo lo registra.
+    await sleep(3000);
   }
 
   // ── RIEPILOGO ──
