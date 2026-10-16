@@ -17,29 +17,53 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ── Trova il mercato BTC 5 minuti in corso ──────────────────────────────
 async function trovaMercato() {
-  const r = await fetch(`${GAMMA}/markets?closed=false&active=true&limit=500`);
-  if (!r.ok) throw new Error(`gamma HTTP ${r.status}`);
-  const j = await r.json();
-  const arr = Array.isArray(j) ? j : j.data || [];
-  console.log(`[gamma] ${arr.length} mercati attivi`);
+  // 1) prova la serie dedicata dei round BTC up/down
+  const serie = [
+    `${GAMMA}/events?closed=false&active=true&limit=100&order=endDate&ascending=true`,
+    `${GAMMA}/markets?closed=false&active=true&limit=100&order=endDate&ascending=true`,
+    `${GAMMA}/markets?closed=false&active=true&limit=100&tag=bitcoin`,
+    `${GAMMA}/events?closed=false&active=true&limit=100&tag=bitcoin`,
+  ];
 
-  const cand = arr.filter(m => {
-    const s = (m.slug || "").toLowerCase();
-    const q = (m.question || "").toLowerCase();
-    return (s.includes("btc") && (s.includes("5m") || s.includes("5-min"))) ||
-           (q.includes("bitcoin") && q.includes("min"));
+  let arr = [];
+  for (const url of serie) {
+    try {
+      const r = await fetch(url);
+      if (!r.ok) { console.log(`[gamma] HTTP ${r.status} su ${url}`); continue; }
+      const j = await r.json();
+      arr = Array.isArray(j) ? j : j.data || [];
+      console.log(`[gamma] ${arr.length} da ${url.split("?")[0].split("/").pop()}`);
+      if (arr.length) break;
+    } catch (e) {
+      console.log(`[gamma] errore: ${e.message}`);
+    }
+  }
+  if (!arr.length) return null;
+
+  // 2) filtra: BTC + qualcosa che indichi 5 minuti
+  const candidati = arr.filter(x => {
+    const s = ((x.slug || "") + " " + (x.ticker || "")).toLowerCase();
+    const t = ((x.title || "") + " " + (x.question || "")).toLowerCase();
+    return (s.includes("btc") || s.includes("bitcoin")) &&
+           (s.includes("5m") || s.includes("5-min") || s.includes("hourly") ||
+            t.includes("5 min") || t.includes("up or down"));
   });
 
-  if (!cand.length) {
-    console.log(`[gamma] nessun BTC 5m trovato. Esempi di slug reali:`);
-    for (const m of arr.slice(0, 8)) console.log(`   ${m.slug}`);
+  if (!candidati.length) {
+    console.log(`[gamma] nessun BTC trovato. Slug disponibili:`);
+    for (const x of arr.slice(0, 12)) console.log(`   ${x.slug || x.ticker}`);
     return null;
   }
 
-  console.log(`[gamma] ${cand.length} candidati BTC 5m`);
+  console.log(`[gamma] ${candidati.length} candidati`);
+  const x = candidati[0];
 
-  cand.sort((a, b) => new Date(a.endDate) - new Date(b.endDate));
-  const m = cand[0];
+  // 3) l'elemento puo' essere un evento (con .markets) o un mercato
+  let m = x;
+  if (Array.isArray(x.markets) && x.markets.length) {
+    m = x.markets.find(y => y.closed !== true) || x.markets[0];
+    console.log(`[gamma] evento ${x.slug} → mercato ${m.slug}`);
+  }
 
   let tok = [], outs = [];
   try { tok = JSON.parse(m.clobTokenIds || "[]"); } catch {}
@@ -52,20 +76,18 @@ async function trovaMercato() {
   const iUp = outs.findIndex(o => /up/i.test(o));
   const iDn = outs.findIndex(o => /down/i.test(o));
 
-  console.log(`[gamma] round scelto: ${m.slug} | ${m.question} | chiude ${m.endDate}`);
+  console.log(`[gamma] round: ${m.slug} | ${m.question} | chiude ${m.endDate}`);
   console.log(`[gamma] outcomes: ${JSON.stringify(outs)}`);
 
   return {
-    conditionId: m.conditionId,
-    question: m.question,
-    slug: m.slug,
+    conditionId: m.conditionId, question: m.question, slug: m.slug,
     endDate: m.endDate,
     upToken: tok[iUp >= 0 ? iUp : 0],
     downToken: tok[iDn >= 0 ? iDn : 1],
   };
 }
 
-// ── Leggi il book completo (bid/ask/size) ───────────────────────────────
+// ── Leggi il book (bid/ask/size) ────────────────────────────────────────
 async function leggiBook(tokenId) {
   try {
     const r = await fetch(`${CLOB}/book?token_id=${tokenId}`);
@@ -78,17 +100,13 @@ async function leggiBook(tokenId) {
     if (!bids.length || !asks.length) return null;
     bids.sort((a, b) => b.p - a.p);
     asks.sort((a, b) => a.p - b.p);
-
-    const sizeFino = (livelli, limite) =>
-      livelli.filter(l => l.p <= limite).reduce((t, l) => t + l.s, 0);
-
+    const sizeFino = (liv, lim) => liv.filter(l => l.p <= lim).reduce((t, l) => t + l.s, 0);
     return {
       bid: bids[0].p, bidSize: bids[0].s,
       ask: asks[0].p, askSize: asks[0].s,
       sizeAsk47: sizeFino(asks, 0.47),
       sizeAsk48: sizeFino(asks, 0.48),
       sizeAsk49: sizeFino(asks, 0.49),
-      spread: +(asks[0].p - bids[0].p).toFixed(4),
     };
   } catch { return null; }
 }
@@ -104,73 +122,47 @@ async function registraRound(mkt) {
 
   while (Date.now() < fine && Date.now() - inizio < 6 * 60 * 1000) {
     const rem = Math.max(0, (fine - Date.now()) / 60000);
-    const [bUp, bDn] = await Promise.all([
-      leggiBook(mkt.upToken),
-      leggiBook(mkt.downToken),
-    ]);
-
+    const [bUp, bDn] = await Promise.all([leggiBook(mkt.upToken), leggiBook(mkt.downToken)]);
     if (bUp && bDn) {
       letture++;
       righe.push({
         rem: +rem.toFixed(2),
-        up_ask: bUp.ask, up_ask_size: bUp.askSize,
-        up_size47: bUp.sizeAsk47, up_size48: bUp.sizeAsk48,
-        up_bid: bUp.bid,
-        dn_ask: bDn.ask, dn_ask_size: bDn.askSize,
-        dn_size47: bDn.sizeAsk47, dn_size48: bDn.sizeAsk48,
-        dn_bid: bDn.bid,
+        up_ask: bUp.ask, up_size47: bUp.sizeAsk47, up_size48: bUp.sizeAsk48, up_bid: bUp.bid,
+        dn_ask: bDn.ask, dn_size47: bDn.sizeAsk47, dn_size48: bDn.sizeAsk48, dn_bid: bDn.bid,
       });
-
       if (letture % 15 === 0) {
-        console.log(
-          `rem ${rem.toFixed(1)}' | UP ask ${bUp.ask} (size<=.47: ${bUp.sizeAsk47}) ` +
-          `| DN ask ${bDn.ask} (size<=.48: ${bDn.sizeAsk48})`
-        );
+        console.log(`rem ${rem.toFixed(1)}' | UP ask ${bUp.ask} (<=.47: ${bUp.sizeAsk47}) | DN ask ${bDn.ask} (<=.48: ${bDn.sizeAsk48})`);
       }
     }
     await sleep(POLL_MS);
   }
-
   console.log(`[round] ${letture} letture`);
-  return { righe, ticket: mkt };
+  return { righe };
 }
 
 // ── Analisi ─────────────────────────────────────────────────────────────
 function analizza(tutti) {
   const flat = tutti.flatMap(r => r.righe);
   if (!flat.length) return null;
-
   const media = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
-  const mediana = a => {
-    const s = [...a].sort((x, y) => x - y);
-    return s[Math.floor(s.length / 2)];
-  };
-
-  const upAsk = flat.map(r => r.up_ask);
-  const dnAsk = flat.map(r => r.dn_ask);
-  const sommaAsk = flat.map(r => r.up_ask + r.dn_ask);
-
-  const entrambi4748 = flat.filter(r => r.up_ask <= 0.47 && r.dn_ask <= 0.48).length;
-  const entrambi4747 = flat.filter(r => r.up_ask <= 0.47 && r.dn_ask <= 0.47).length;
-  const entrambi4848 = flat.filter(r => r.up_ask <= 0.48 && r.dn_ask <= 0.48).length;
-
-  const sizeUp47 = flat.map(r => r.up_size47).filter(s => s > 0);
-  const sizeDn48 = flat.map(r => r.dn_size48).filter(s => s > 0);
-
+  const mediana = a => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
+  const up = flat.map(r => r.up_ask), dn = flat.map(r => r.dn_ask);
+  const somma = flat.map(r => r.up_ask + r.dn_ask);
+  const c4748 = flat.filter(r => r.up_ask <= 0.47 && r.dn_ask <= 0.48).length;
+  const c4747 = flat.filter(r => r.up_ask <= 0.47 && r.dn_ask <= 0.47).length;
+  const c4848 = flat.filter(r => r.up_ask <= 0.48 && r.dn_ask <= 0.48).length;
+  const s47 = flat.map(r => r.up_size47).filter(s => s > 0);
+  const s48 = flat.map(r => r.dn_size48).filter(s => s > 0);
   return {
     letture: flat.length,
-    round: tutti.length,
-    upAskMedio: +media(upAsk).toFixed(3),
-    dnAskMedio: +media(dnAsk).toFixed(3),
-    upAskMediano: +mediana(upAsk).toFixed(3),
-    dnAskMediano: +mediana(dnAsk).toFixed(3),
-    sommaAskMedia: +media(sommaAsk).toFixed(3),
-    sommaAskMediana: +mediana(sommaAsk).toFixed(3),
-    pctEntrambi4748: +(entrambi4748 / flat.length * 100).toFixed(1),
-    pctEntrambi4747: +(entrambi4747 / flat.length * 100).toFixed(1),
-    pctEntrambi4848: +(entrambi4848 / flat.length * 100).toFixed(1),
-    sizeMediaUp47: +media(sizeUp47).toFixed(1),
-    sizeMediaDn48: +media(sizeDn48).toFixed(1),
+    upAskMedio: +media(up).toFixed(3), dnAskMedio: +media(dn).toFixed(3),
+    upAskMediano: +mediana(up).toFixed(3), dnAskMediano: +mediana(dn).toFixed(3),
+    sommaAskMedia: +media(somma).toFixed(3), sommaAskMediana: +mediana(somma).toFixed(3),
+    pctEntrambi4748: +(c4748 / flat.length * 100).toFixed(1),
+    pctEntrambi4747: +(c4747 / flat.length * 100).toFixed(1),
+    pctEntrambi4848: +(c4848 / flat.length * 100).toFixed(1),
+    sizeMediaUp47: +media(s47).toFixed(1),
+    sizeMediaDn48: +media(s48).toFixed(1),
   };
 }
 
@@ -181,17 +173,9 @@ function analizza(tutti) {
 
   while (Date.now() < fine) {
     const mkt = await trovaMercato();
-    if (!mkt) {
-      console.log("riprovo tra 20s");
-      await sleep(20000);
-      continue;
-    }
-    try {
-      const r = await registraRound(mkt);
-      tutti.push(r);
-    } catch (e) {
-      console.error("errore round:", e.message);
-    }
+    if (!mkt) { console.log("riprovo tra 20s"); await sleep(20000); continue; }
+    try { tutti.push(await registraRound(mkt)); }
+    catch (e) { console.error("errore round:", e.message); }
     await sleep(3000);
   }
 
@@ -202,7 +186,7 @@ function analizza(tutti) {
   if (a) {
     const { error } = await supabase.from("signals").insert([{
       category: "btc-book-test",
-      market_title: `Misurazione book ${a.round} round`,
+      market_title: `Misurazione book ${a.letture} letture`,
       signal_type: "book-misura",
       detail: JSON.stringify(a),
       edge: +(1 - a.sommaAskMedia).toFixed(4),
