@@ -13,6 +13,7 @@ const CLOB = "https://clob.polymarket.com";
 const POLL_MS = 2000;
 const SOGLIA = 0.47;
 const DURATA_MIN = 70;
+const FEE_CRYPTO = 0.07;   // taker fee rate categoria crypto (fee = p*(1-p)*0.07 per share)
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -73,6 +74,8 @@ async function book(tokenId) {
       bid: bids.length ? bids[0].p : null,
       ask: asks.length ? asks[0].p : null,
       size47: sizeFino(asks, 0.47),
+      size45: sizeFino(asks, 0.45),
+      size43: sizeFino(asks, 0.43),
     };
   } catch { return null; }
 }
@@ -87,6 +90,7 @@ async function feeRewards(conditionId) {
       makerFee: j.mbf ?? null, takerFee: j.tbf ?? null, rewards: j.r ?? null,
       feeRate: (j.fd && j.fd.r != null) ? j.fd.r : null,
       tickSize: j.mts ?? null, minOrderSize: j.mos ?? null,
+      takerDelay: j.itode ?? null,
     };
   } catch { return null; }
 }
@@ -144,6 +148,7 @@ async function registraRound(mkt) {
   let upTocco = null, dnTocco = null;
   let minUp = 99, minDn = 99;
   let mio35 = null, mio30 = null;
+  let apertura = null;
 
   while (Date.now() < mkt.fine) {
     const rem = Math.max(0, (mkt.fine - Date.now()) / 60000);
@@ -157,6 +162,14 @@ async function registraRound(mkt) {
       lettureOk++;
       if (bUp.ask < minUp) minUp = bUp.ask;
       if (bDn.ask < minDn) minDn = bDn.ask;
+
+      // ── MAKER / TAKER all'apertura ──
+      if (!apertura) {
+        apertura = { upAsk: bUp.ask, dnAsk: bDn.ask, rem };
+        const upMaker = bUp.ask > SOGLIA;
+        const dnMaker = bDn.ask > SOGLIA;
+        console.log(`  APERTURA rem ${rem.toFixed(2)}' | UP ask ${bUp.ask} = ${upMaker ? "MAKER" : "TAKER"} | DN ask ${bDn.ask} = ${dnMaker ? "MAKER" : "TAKER"}`);
+      }
 
       if (!upTocco && bUp.ask <= SOGLIA) {
         upTocco = { px: bUp.ask, rem, size: bUp.size47 };
@@ -195,6 +208,17 @@ async function registraRound(mkt) {
   const mioLato = primo;
   const ioVinto = (mioLato && vincitore !== "?") ? mioLato === vincitore : null;
 
+  // ── maker/taker + fee stimata ──
+  let upMaker = null, dnMaker = null, feeStimata = 0;
+  if (apertura) {
+    upMaker = apertura.upAsk > SOGLIA;
+    dnMaker = apertura.dnAsk > SOGLIA;
+    // sul lato TAKER (ask <= soglia) compro a quell'ask e pago fee = p*(1-p)*0.07
+    if (upTocco && !upMaker) feeStimata += upTocco.px * (1 - upTocco.px) * FEE_CRYPTO;
+    if (dnTocco && !dnMaker) feeStimata += dnTocco.px * (1 - dnTocco.px) * FEE_CRYPTO;
+    feeStimata = +feeStimata.toFixed(5);
+  }
+
   console.log(`\n>>> ROUND ${mkt.slug}`);
   console.log(`    letture ok: ${lettureOk} | vuote: ${lettureVuote} | errori: ${lettureErrore}`);
   console.log(`    UP   tocca ${SOGLIA}: ${upTocco ? upTocco.px + " @ " + upTocco.rem.toFixed(2) + "min" : "NO"} (minimo ${minUp === 99 ? "-" : minUp})`);
@@ -206,8 +230,11 @@ async function registraRound(mkt) {
     console.log(`    STOP: sotto 0.35 a ${mio35 === null ? "MAI" : mio35.toFixed(2) + "'"} | sotto 0.30 a ${mio30 === null ? "MAI" : mio30.toFixed(2) + "'"}`);
   }
   if (mioLato && ioVinto !== null) console.log(`    IL MIO LATO (${mioLato}) → ${ioVinto ? "VINTO" : "PERSO"}`);
+  if (apertura) {
+    console.log(`    MAKER? UP ${upMaker ? "SI" : "NO"} | DN ${dnMaker ? "SI" : "NO"} | fee stimata ${feeStimata}/share`);
+  }
   if (fr) {
-    console.log(`    FEE/REWARDS: maker ${fr.makerFee} | taker ${fr.takerFee} | feeRate ${fr.feeRate} | pool ${fr.rewards ? JSON.stringify(fr.rewards).slice(0, 120) : "nessuna"} | tick ${fr.tickSize} | minSize ${fr.minOrderSize}`);
+    console.log(`    FEE/REWARDS: maker ${fr.makerFee} | taker ${fr.takerFee} | feeRate ${fr.feeRate} | pool ${fr.rewards ? JSON.stringify(fr.rewards) : "nessuna"} | tick ${fr.tickSize} | minSize ${fr.minOrderSize} | takerDelay ${fr.takerDelay}`);
   }
   console.log(`<<<\n`);
 
@@ -216,7 +243,7 @@ async function registraRound(mkt) {
     upTocco, dnTocco, primo, salitoDiretto, vincitore, mioLato, ioVinto,
     lettureOk, lettureVuote, lettureErrore,
     minUp: minUp === 99 ? null : minUp, minDn: minDn === 99 ? null : minDn,
-    mio35, mio30, fee: fr,
+    mio35, mio30, apertura, upMaker, dnMaker, feeStimata, fee: fr,
   };
 }
 
@@ -247,6 +274,7 @@ async function registraRound(mkt) {
           vince: r.vincitore, mioLato: r.mioLato, ioVinto: r.ioVinto,
           lettureOk: r.lettureOk, lettureVuote: r.lettureVuote, lettureErrore: r.lettureErrore,
           minUp: r.minUp, minDn: r.minDn, stop35: r.mio35, stop30: r.mio30,
+          apertura: r.apertura, upMaker: r.upMaker, dnMaker: r.dnMaker, feeStimata: r.feeStimata,
           fee: r.fee,
         }),
         edge: r.costo ? +(1 - r.costo).toFixed(4) : null,
@@ -259,16 +287,24 @@ async function registraRound(mkt) {
     await sleep(3000);
   }
 
+  // ── RIEPILOGO ──
   const coppie = risultati.filter(r => r.esito === "COPPIA");
   const unLato = risultati.filter(r => r.esito === "UN_LATO");
   const vinti = unLato.filter(r => r.ioVinto === true).length;
   const conStop = unLato.filter(r => r.mio35 !== null).length;
-  const pnlCoppie = coppie.reduce((t, r) => t + (1 - r.costo), 0);
+  const pnlLordo = coppie.reduce((t, r) => t + (1 - r.costo), 0);
   const costoMedio = coppie.length ? coppie.reduce((t, r) => t + r.costo, 0) / coppie.length : 0;
+
+  const conApertura = risultati.filter(r => r.apertura);
+  const entrambiMaker = conApertura.filter(r => r.upMaker && r.dnMaker).length;
+  const unoTaker = conApertura.filter(r => !r.upMaker || !r.dnMaker).length;
+  const feeTot = coppie.reduce((t, r) => t + (r.feeStimata || 0), 0);
+  const pnlNetto = pnlLordo - feeTot;
 
   console.log(`\n════ RIEPILOGO FINALE ════`);
   console.log(`round registrati: ${risultati.length}`);
-  console.log(`COPPIA:  ${coppie.length} | costo medio ${costoMedio.toFixed(3)} | PnL medio ${coppie.length ? (pnlCoppie / coppie.length).toFixed(3) : "-"} | totale ${pnlCoppie.toFixed(2)}`);
+  console.log(`COPPIA:  ${coppie.length} | costo medio ${costoMedio.toFixed(3)} | PnL LORDO ${pnlLordo.toFixed(2)}`);
+  console.log(`fee stimata: ${feeTot.toFixed(2)} | PnL NETTO ${pnlNetto.toFixed(2)}`);
+  console.log(`MAKER: ${entrambiMaker} round entrambi maker | ${unoTaker} con almeno un lato taker`);
   console.log(`UN_LATO: ${unLato.length} | vinti: ${vinti} | con discesa sotto 0.35: ${conStop}`);
-  console.log(`NIENTE_LETTURE: ${risultati.filter(r => r.esito === "NIENTE_LETTURE").length}`);
 })();
