@@ -21,12 +21,13 @@ const STOP_SELL   = 0.35;
 const POLL_MS     = 1500;
 const DURATA_MIN  = 70;
 const FEE_CRYPTO  = 0.07;
+const FEE_BPS     = 1000;    // fee rate richiesta dal mercato (obbligatoria in firma)
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function clob() {
   const w = new ethers.Wallet(process.env.PRIVATE_KEY);
-  return new ClobClient(CLOB, CHAIN, w, undefined, undefined, 0);
+  return new ClobClient(CLOB, CHAIN, w, undefined, undefined, 0, w.address);
 }
 
 async function trovaRound() {
@@ -96,13 +97,13 @@ async function infoMercato(conditionId) {
 
 async function ordineLimite(cli, token, price, usdc) {
   const size = +(usdc / price).toFixed(2);
-  const o = await cli.createOrder({ tokenID: token, price, size, side: Side.BUY, feeRateBps: 1000});
+  const o = await cli.createOrder({ tokenID: token, price, size, side: Side.BUY, feeRateBps: FEE_BPS });
   const res = await cli.postOrder(o, OrderType.GTC);
   return res && res.orderID ? { id: res.orderID, size } : null;
 }
 
 async function ordineVendita(cli, token, price, size) {
-  const o = await cli.createOrder({ tokenID: token, price, size, side: Side.SELL, feeRateBps: 1000});
+  const o = await cli.createOrder({ tokenID: token, price, size, side: Side.SELL, feeRateBps: FEE_BPS });
   const res = await cli.postOrder(o, OrderType.GTC);
   return res && res.orderID ? res.orderID : null;
 }
