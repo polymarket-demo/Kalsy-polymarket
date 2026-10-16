@@ -11,7 +11,7 @@ const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB = "https://clob.polymarket.com";
 
 const POLL_MS = 2000;
-const SOGLIA = 0.47;          // soglia per entrambi i lati
+const SOGLIA = 0.47;
 const DURATA_MIN = 70;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -42,7 +42,7 @@ async function trovaMercato() {
     const fine = new Date(m.endDate).getTime();
     if (fine < Date.now()) continue;
 
-    console.log(`[gamma] ROUND ${m.slug} | chiude tra ${((fine - Date.now())/60000).toFixed(1)}'`);
+    console.log(`[gamma] ROUND ${m.slug} | chiude tra ${((fine - Date.now()) / 60000).toFixed(1)}'`);
     return {
       slug: m.slug, question: m.question, fine,
       upToken: tok[iUp >= 0 ? iUp : 0],
@@ -70,12 +70,11 @@ async function book(tokenId) {
       bid: bids.length ? bids[0].p : null,
       ask: asks.length ? asks[0].p : null,
       size47: sizeFino(asks, 0.47),
-      size48: sizeFino(asks, 0.48),
     };
   } catch { return null; }
 }
 
-// ── Registra un round, con riepilogo ed esito ──────────────────────────
+// ── Registra un round ───────────────────────────────────────────────────
 async function registraRound(mkt) {
   console.log(`\n=== ${mkt.slug} | ${mkt.question} ===`);
 
@@ -92,21 +91,21 @@ async function registraRound(mkt) {
 
       if (!upTocco && bUp.ask <= SOGLIA) {
         upTocco = { px: bUp.ask, rem, size: bUp.size47 };
-        console.log(`  ↑ UP tocca ${SOGLIA} a ${rem.toFixed(2)}' (ask ${bUp.ask}, size ${bUp.size47.toFixed(0)})`);
+        console.log(`  UP tocca ${SOGLIA} a ${rem.toFixed(2)}' (ask ${bUp.ask}, size ${bUp.size47.toFixed(0)})`);
       }
       if (!dnTocco && bDn.ask <= SOGLIA) {
         dnTocco = { px: bDn.ask, rem, size: bDn.size47 };
-        console.log(`  ↓ DOWN tocca ${SOGLIA} a ${rem.toFixed(2)}' (ask ${bDn.ask}, size ${bDn.size47.toFixed(0)})`);
+        console.log(`  DOWN tocca ${SOGLIA} a ${rem.toFixed(2)}' (ask ${bDn.ask}, size ${bDn.size47.toFixed(0)})`);
       }
 
-      if (letture % 30 === 1) {
+      if (letture % 40 === 1) {
         console.log(`  rem ${rem.toFixed(1)}' | UP ${bUp.ask} | DN ${bDn.ask}`);
       }
     }
     await sleep(POLL_MS);
   }
 
-  // ── ESITO: chi ha vinto ──
+  // ── ESITO: chi ha vinto (letto dal book a round chiuso) ──
   let vincitore = "?";
   let fUp = null, fDn = null;
   try {
@@ -117,37 +116,42 @@ async function registraRound(mkt) {
     }
   } catch {}
 
+  // ── Chi ha toccato per primo, e l'altro è salito diretto? ──
+  let primo = null, secondo = null, salitoDiretto = null;
+
+  if (upTocco && dnTocco) {
+    // tocca prima chi ha rem maggiore (piu' minuti residui = piu' presto)
+    primo = upTocco.rem > dnTocco.rem ? "UP" : "DOWN";
+    secondo = primo === "UP" ? "DOWN" : "UP";
+  } else if (upTocco) {
+    primo = "UP"; salitoDiretto = "DOWN";
+  } else if (dnTocco) {
+    primo = "DOWN"; salitoDiretto = "UP";
+  }
+
   const esito = upTocco && dnTocco ? "COPPIA"
               : (upTocco || dnTocco ? "UN_LATO" : "NESSUNO");
   const costo = upTocco && dnTocco ? upTocco.px + dnTocco.px : null;
 
-  // chi dei due lati ho potuto comprare, e ha vinto?
-  let latoComprato = null, haVinto = null;
-  if (upTocco && dnTocco) {
-    latoComprato = "ENTRAMBI";
-    haVinto = "certo";           // la coppia paga sempre 1.00
-  } else if (upTocco) {
-    latoComprato = "UP";
-    haVinto = vincitore === "UP";
-  } else if (dnTocco) {
-    latoComprato = "DOWN";
-    haVinto = vincitore === "DOWN";
-  }
+  // il mio lato è il PRIMO che scende (compro quello)
+  const mioLato = primo;
+  const ioVinto = (mioLato && vincitore !== "?") ? mioLato === vincitore : null;
 
   console.log(`\n>>> ROUND ${mkt.slug}`);
   console.log(`    letture: ${letture}`);
-  console.log(`    UP  tocca ${SOGLIA}: ${upTocco ? upTocco.px + " @ " + upTocco.rem.toFixed(2) + "min" : "NO"}`);
+  console.log(`    UP   tocca ${SOGLIA}: ${upTocco ? upTocco.px + " @ " + upTocco.rem.toFixed(2) + "min" : "NO"}`);
   console.log(`    DOWN tocca ${SOGLIA}: ${dnTocco ? dnTocco.px + " @ " + dnTocco.rem.toFixed(2) + "min" : "NO"}`);
-  console.log(`    ESITO: ${esito}${costo ? " | costo " + costo.toFixed(2) + " | PnL GARANTITO " + (1 - costo).toFixed(2) : ""}`);
+  console.log(`    PRIMO: ${primo || "nessuno"}${salitoDiretto ? ` | ${salitoDiretto} è SALITO senza scendere` : ""}`);
+  console.log(`    ESITO: ${esito}${costo ? " | costo " + costo.toFixed(2) + " | PnL " + (1 - costo).toFixed(2) : ""}`);
   console.log(`    VINCE: ${vincitore} (UP bid ${fUp ? fUp.bid : "?"} / DN bid ${fDn ? fDn.bid : "?"})`);
-  if (latoComprato && latoComprato !== "ENTRAMBI") {
-    console.log(`    lato comprato: ${latoComprato} → ${haVinto ? "HA VINTO ✓" : "HA PERSO ✗"}`);
+  if (mioLato && ioVinto !== null) {
+    console.log(`    IL MIO LATO (${mioLato}) → ${ioVinto ? "VINTO ✓" : "PERSO ✗"}`);
   }
   console.log(`<<<\n`);
 
   return {
-    slug: mkt.slug, letture, esito,
-    upTocco, dnTocco, costo, vincitore, latoComprato, haVinto,
+    slug: mkt.slug, letture, esito, upTocco, dnTocco, costo,
+    vincitore, primo, salitoDiretto, mioLato, ioVinto,
   };
 }
 
@@ -173,7 +177,8 @@ async function registraRound(mkt) {
         signal_type: r.esito,
         detail: JSON.stringify({
           up: r.upTocco, dn: r.dnTocco, costo: r.costo,
-          vince: r.vincitore, latoComprato: r.latoComprato, haVinto: r.haVinto,
+          primo: r.primo, salitoDiretto: r.salitoDiretto,
+          vince: r.vincitore, mioLato: r.mioLato, ioVinto: r.ioVinto,
         }),
         edge: r.costo ? +(1 - r.costo).toFixed(4) : null,
         live: r.esito === "COPPIA",
@@ -190,11 +195,12 @@ async function registraRound(mkt) {
   // ── RIEPILOGO FINALE ──
   const coppie = risultati.filter(r => r.esito === "COPPIA");
   const unLato = risultati.filter(r => r.esito === "UN_LATO");
-  const soloUnoVinto = unLato.filter(r => r.haVinto === true).length;
+  const unLatoVinti = unLato.filter(r => r.ioVinto === true).length;
+  const pnlCoppie = coppie.reduce((t, r) => t + (1 - r.costo), 0);
 
   console.log(`\n════ RIEPILOGO FINALE ════`);
-  console.log(`round registrati: ${risultati.length}`);
-  console.log(`COPPIA:   ${coppie.length}  → PnL garantito medio: ${coppie.length ? (coppie.reduce((t,r)=>t+(1-r.costo),0)/coppie.length).toFixed(3) : "n/d"}`);
-  console.log(`UN_LATO:  ${unLato.length}  → di cui vinti: ${soloUnoVinto}`);
-  console.log(`NESSUNO:  ${risultati.filter(r => r.esito === "NESSUNO").length}`);
+  console.log(`round: ${risultati.length}`);
+  console.log(`COPPIA:  ${coppie.length}  → PnL medio ${coppie.length ? (pnlCoppie / coppie.length).toFixed(3) : "n/d"} | totale ${pnlCoppie.toFixed(2)}`);
+  console.log(`UN_LATO: ${unLato.length}  → di cui il PRIMO lato ha vinto: ${unLatoVinti}`);
+  console.log(`NESSUNO: ${risultati.filter(r => r.esito === "NESSUNO").length}`);
 })();
