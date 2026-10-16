@@ -96,13 +96,13 @@ async function infoMercato(conditionId) {
 
 async function ordineLimite(cli, token, price, usdc) {
   const size = +(usdc / price).toFixed(2);
-  const o = await cli.createOrder({ tokenID: token, price, size, side: Side.BUY, feeRateBps: 0 });
+  const o = await cli.createOrder({ tokenID: token, price, size, side: Side.BUY, feeRateBps: 1000});
   const res = await cli.postOrder(o, OrderType.GTC);
   return res && res.orderID ? { id: res.orderID, size } : null;
 }
 
 async function ordineVendita(cli, token, price, size) {
-  const o = await cli.createOrder({ tokenID: token, price, size, side: Side.SELL, feeRateBps: 0 });
+  const o = await cli.createOrder({ tokenID: token, price, size, side: Side.SELL, feeRateBps: 1000});
   const res = await cli.postOrder(o, OrderType.GTC);
   return res && res.orderID ? res.orderID : null;
 }
