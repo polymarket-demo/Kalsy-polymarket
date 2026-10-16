@@ -11,180 +11,190 @@ const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB = "https://clob.polymarket.com";
 
 const POLL_MS = 2000;
+const SOGLIA = 0.47;          // soglia per entrambi i lati
 const DURATA_MIN = 70;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ── Trova il round BTC 5m IN CORSO, calcolando lo slug ─────────────────
-// Lo slug e' btc-updown-5m-<epoch dell'apertura>. Ora arrotondata a 300s.
+// ── Trova il round in corso ─────────────────────────────────────────────
 async function trovaMercato() {
-  const adessoSec = Math.floor(Date.now() / 1000);
-  const inizio = Math.floor(adessoSec / 300) * 300;
+  const now = Math.floor(Date.now() / 1000);
+  const base = Math.floor(now / 300) * 300;
 
-  // prova il round corrente e i 2 precedenti (nel caso sia appena partito)
-  for (const off of [0, -300, -600]) {
-    const slug = `btc-updown-5m-${inizio + off}`;
-    const url = `${GAMMA}/events?slug=${slug}`;
-    try {
-      const r = await fetch(url);
-      if (!r.ok) { console.log(`[gamma] HTTP ${r.status} per ${slug}`); continue; }
-      const j = await r.json();
-      const evs = Array.isArray(j) ? j : j.data || [];
-      if (!evs.length) { console.log(`[gamma] ${slug} non esiste`); continue; }
+  for (const off of [0, -300]) {
+    const slug = `btc-updown-5m-${base + off}`;
+    const r = await fetch(`${GAMMA}/events?slug=${slug}`);
+    if (!r.ok) continue;
+    const j = await r.json();
+    const evs = Array.isArray(j) ? j : j.data || [];
+    if (!evs.length) continue;
 
-      const ev = evs[0];
-      const ms = ev.markets || [];
-      console.log(`[gamma] trovato ${slug} con ${ms.length} mercati`);
-      if (!ms.length) continue;
+    const m = (evs[0].markets || [])[0];
+    if (!m) continue;
 
-      const m = ms[0];
-      let tok = [], outs = [];
-      try { tok = JSON.parse(m.clobTokenIds || "[]"); } catch {}
-      try { outs = JSON.parse(m.outcomes || "[]"); } catch {}
-      if (tok.length < 2) { console.log(`[gamma] token mancanti`); continue; }
+    let tok = [], outs = [];
+    try { tok = JSON.parse(m.clobTokenIds || "[]"); } catch {}
+    try { outs = JSON.parse(m.outcomes || "[]"); } catch {}
+    if (tok.length < 2) continue;
 
-      const iUp = outs.findIndex(o => /up/i.test(o));
-      const iDn = outs.findIndex(o => /down/i.test(o));
-      const fine = new Date(m.endDate).getTime();
-      const manca = (fine - Date.now()) / 60000;
+    const iUp = outs.findIndex(o => /up/i.test(o));
+    const iDn = outs.findIndex(o => /down/i.test(o));
+    const fine = new Date(m.endDate).getTime();
+    if (fine < Date.now()) continue;
 
-      console.log(`[gamma] ROUND ${m.slug} | chiude tra ${manca.toFixed(1)}' | outcomes ${JSON.stringify(outs)}`);
-
-      return {
-        conditionId: m.conditionId, question: m.question, slug: m.slug,
-        endDate: m.endDate,
-        upToken: tok[iUp >= 0 ? iUp : 0],
-        downToken: tok[iDn >= 0 ? iDn : 1],
-      };
-    } catch (e) {
-      console.log(`[gamma] errore su ${slug}: ${e.message}`);
-    }
+    console.log(`[gamma] ROUND ${m.slug} | chiude tra ${((fine - Date.now())/60000).toFixed(1)}'`);
+    return {
+      slug: m.slug, question: m.question, fine,
+      upToken: tok[iUp >= 0 ? iUp : 0],
+      downToken: tok[iDn >= 0 ? iDn : 1],
+    };
   }
   return null;
 }
 
-// ── Leggi il book (bid/ask/size) ────────────────────────────────────────
-async function leggiBook(tokenId) {
+// ── Book ────────────────────────────────────────────────────────────────
+async function book(tokenId) {
   try {
     const r = await fetch(`${CLOB}/book?token_id=${tokenId}`);
-    if (!r.ok) {
-      console.log(`[book] HTTP ${r.status}`);
-      return null;
-    }
+    if (!r.ok) return null;
     const j = await r.json();
     const bids = (j.bids || []).map(b => ({ p: parseFloat(b.price), s: parseFloat(b.size) }))
       .filter(x => x.p > 0 && x.p < 1);
     const asks = (j.asks || []).map(a => ({ p: parseFloat(a.price), s: parseFloat(a.size) }))
       .filter(x => x.p > 0 && x.p < 1);
-    if (!bids.length || !asks.length) {
-      console.log(`[book] vuoto (bids ${bids.length}, asks ${asks.length})`);
-      return null;
-    }
+    if (!bids.length && !asks.length) return null;
     bids.sort((a, b) => b.p - a.p);
     asks.sort((a, b) => a.p - b.p);
     const sizeFino = (liv, lim) => liv.filter(l => l.p <= lim).reduce((t, l) => t + l.s, 0);
     return {
-      bid: bids[0].p, ask: asks[0].p,
-      sizeAsk47: sizeFino(asks, 0.47),
-      sizeAsk48: sizeFino(asks, 0.48),
+      bid: bids.length ? bids[0].p : null,
+      ask: asks.length ? asks[0].p : null,
+      size47: sizeFino(asks, 0.47),
+      size48: sizeFino(asks, 0.48),
     };
-  } catch (e) {
-    console.log(`[book] errore: ${e.message}`);
-    return null;
-  }
+  } catch { return null; }
 }
 
-// ── Registra un round ───────────────────────────────────────────────────
+// ── Registra un round, con riepilogo ed esito ──────────────────────────
 async function registraRound(mkt) {
-  const inizio = Date.now();
-  const fine = new Date(mkt.endDate).getTime();
   console.log(`\n=== ${mkt.slug} | ${mkt.question} ===`);
 
-  const righe = [];
   let letture = 0;
+  let upTocco = null;   // { px, rem, size }
+  let dnTocco = null;
 
-  while (Date.now() < fine && Date.now() - inizio < 6 * 60 * 1000) {
-    const rem = Math.max(0, (fine - Date.now()) / 60000);
-    const [bUp, bDn] = await Promise.all([leggiBook(mkt.upToken), leggiBook(mkt.downToken)]);
-    if (bUp && bDn) {
+  while (Date.now() < mkt.fine) {
+    const rem = Math.max(0, (mkt.fine - Date.now()) / 60000);
+    const [bUp, bDn] = await Promise.all([book(mkt.upToken), book(mkt.downToken)]);
+
+    if (bUp && bDn && bUp.ask !== null && bDn.ask !== null) {
       letture++;
-      righe.push({
-        rem: +rem.toFixed(2),
-        up_ask: bUp.ask, up_size47: bUp.sizeAsk47, up_size48: bUp.sizeAsk48, up_bid: bUp.bid,
-        dn_ask: bDn.ask, dn_size47: bDn.sizeAsk47, dn_size48: bDn.sizeAsk48, dn_bid: bDn.bid,
-      });
-      if (letture % 15 === 1) {
-        console.log(`rem ${rem.toFixed(1)}' | UP ask ${bUp.ask} (<=.47: ${bUp.sizeAsk47}) | DN ask ${bDn.ask} (<=.48: ${bDn.sizeAsk48})`);
+
+      if (!upTocco && bUp.ask <= SOGLIA) {
+        upTocco = { px: bUp.ask, rem, size: bUp.size47 };
+        console.log(`  ↑ UP tocca ${SOGLIA} a ${rem.toFixed(2)}' (ask ${bUp.ask}, size ${bUp.size47.toFixed(0)})`);
+      }
+      if (!dnTocco && bDn.ask <= SOGLIA) {
+        dnTocco = { px: bDn.ask, rem, size: bDn.size47 };
+        console.log(`  ↓ DOWN tocca ${SOGLIA} a ${rem.toFixed(2)}' (ask ${bDn.ask}, size ${bDn.size47.toFixed(0)})`);
+      }
+
+      if (letture % 30 === 1) {
+        console.log(`  rem ${rem.toFixed(1)}' | UP ${bUp.ask} | DN ${bDn.ask}`);
       }
     }
     await sleep(POLL_MS);
   }
-  console.log(`[round] ${letture} letture`);
-  return { righe };
-}
 
-// ── Analisi ─────────────────────────────────────────────────────────────
-function analizza(tutti) {
-  const flat = tutti.flatMap(r => r.righe);
-  if (!flat.length) return null;
-  const media = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
-  const mediana = a => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
-  const up = flat.map(r => r.up_ask), dn = flat.map(r => r.dn_ask);
-  const somma = flat.map(r => r.up_ask + r.dn_ask);
-  const c4748 = flat.filter(r => r.up_ask <= 0.47 && r.dn_ask <= 0.48).length;
-  const c4747 = flat.filter(r => r.up_ask <= 0.47 && r.dn_ask <= 0.47).length;
-  const c4848 = flat.filter(r => r.up_ask <= 0.48 && r.dn_ask <= 0.48).length;
-  const s47 = flat.map(r => r.up_size47).filter(s => s > 0);
-  const s48 = flat.map(r => r.dn_size48).filter(s => s > 0);
+  // ── ESITO: chi ha vinto ──
+  let vincitore = "?";
+  let fUp = null, fDn = null;
+  try {
+    const [a, b] = await Promise.all([book(mkt.upToken), book(mkt.downToken)]);
+    fUp = a; fDn = b;
+    if (a && b && a.bid !== null && b.bid !== null) {
+      vincitore = a.bid > b.bid ? "UP" : "DOWN";
+    }
+  } catch {}
+
+  const esito = upTocco && dnTocco ? "COPPIA"
+              : (upTocco || dnTocco ? "UN_LATO" : "NESSUNO");
+  const costo = upTocco && dnTocco ? upTocco.px + dnTocco.px : null;
+
+  // chi dei due lati ho potuto comprare, e ha vinto?
+  let latoComprato = null, haVinto = null;
+  if (upTocco && dnTocco) {
+    latoComprato = "ENTRAMBI";
+    haVinto = "certo";           // la coppia paga sempre 1.00
+  } else if (upTocco) {
+    latoComprato = "UP";
+    haVinto = vincitore === "UP";
+  } else if (dnTocco) {
+    latoComprato = "DOWN";
+    haVinto = vincitore === "DOWN";
+  }
+
+  console.log(`\n>>> ROUND ${mkt.slug}`);
+  console.log(`    letture: ${letture}`);
+  console.log(`    UP  tocca ${SOGLIA}: ${upTocco ? upTocco.px + " @ " + upTocco.rem.toFixed(2) + "min" : "NO"}`);
+  console.log(`    DOWN tocca ${SOGLIA}: ${dnTocco ? dnTocco.px + " @ " + dnTocco.rem.toFixed(2) + "min" : "NO"}`);
+  console.log(`    ESITO: ${esito}${costo ? " | costo " + costo.toFixed(2) + " | PnL GARANTITO " + (1 - costo).toFixed(2) : ""}`);
+  console.log(`    VINCE: ${vincitore} (UP bid ${fUp ? fUp.bid : "?"} / DN bid ${fDn ? fDn.bid : "?"})`);
+  if (latoComprato && latoComprato !== "ENTRAMBI") {
+    console.log(`    lato comprato: ${latoComprato} → ${haVinto ? "HA VINTO ✓" : "HA PERSO ✗"}`);
+  }
+  console.log(`<<<\n`);
+
   return {
-    letture: flat.length,
-    upAskMedio: +media(up).toFixed(3), dnAskMedio: +media(dn).toFixed(3),
-    upAskMediano: +mediana(up).toFixed(3), dnAskMediano: +mediana(dn).toFixed(3),
-    sommaAskMedia: +media(somma).toFixed(3), sommaAskMediana: +mediana(somma).toFixed(3),
-    pctEntrambi4748: +(c4748 / flat.length * 100).toFixed(1),
-    pctEntrambi4747: +(c4747 / flat.length * 100).toFixed(1),
-    pctEntrambi4848: +(c4848 / flat.length * 100).toFixed(1),
-    sizeMediaUp47: +media(s47).toFixed(1),
-    sizeMediaDn48: +media(s48).toFixed(1),
+    slug: mkt.slug, letture, esito,
+    upTocco, dnTocco, costo, vincitore, latoComprato, haVinto,
   };
 }
 
 // ── Main ────────────────────────────────────────────────────────────────
 (async () => {
   const fine = Date.now() + DURATA_MIN * 60000;
-  const tutti = [];
-  let ultimoSlug = null;
+  const fatti = new Set();
+  const risultati = [];
 
   while (Date.now() < fine) {
     const mkt = await trovaMercato();
     if (!mkt) { console.log("riprovo tra 15s"); await sleep(15000); continue; }
+    if (fatti.has(mkt.slug)) { await sleep(15000); continue; }
 
-    if (mkt.slug === ultimoSlug) {
-      console.log(`[main] ${mkt.slug} gia' registrato, aspetto il prossimo`);
-      await sleep(15000);
-      continue;
+    try {
+      const r = await registraRound(mkt);
+      fatti.add(mkt.slug);
+      risultati.push(r);
+
+      await supabase.from("signals").insert([{
+        category: "btc-maker-test",
+        market_title: r.slug,
+        signal_type: r.esito,
+        detail: JSON.stringify({
+          up: r.upTocco, dn: r.dnTocco, costo: r.costo,
+          vince: r.vincitore, latoComprato: r.latoComprato, haVinto: r.haVinto,
+        }),
+        edge: r.costo ? +(1 - r.costo).toFixed(4) : null,
+        live: r.esito === "COPPIA",
+      }]);
+    } catch (e) {
+      console.error("errore:", e.message);
     }
-    ultimoSlug = mkt.slug;
 
-    try { tutti.push(await registraRound(mkt)); }
-    catch (e) { console.error("errore round:", e.message); }
-    await sleep(3000);
+    const now = Math.floor(Date.now() / 1000);
+    const prox = (Math.floor(now / 300) + 1) * 300;
+    await sleep(Math.max(1000, (prox - now) * 1000 + 2000));
   }
 
-  const a = analizza(tutti);
-  console.log("\n=== ANALISI ===");
-  console.log(JSON.stringify(a, null, 2));
+  // ── RIEPILOGO FINALE ──
+  const coppie = risultati.filter(r => r.esito === "COPPIA");
+  const unLato = risultati.filter(r => r.esito === "UN_LATO");
+  const soloUnoVinto = unLato.filter(r => r.haVinto === true).length;
 
-  if (a) {
-    const { error } = await supabase.from("signals").insert([{
-      category: "btc-book-test",
-      market_title: `Misurazione book ${tutti.length} round`,
-      signal_type: "book-misura",
-      detail: JSON.stringify(a),
-      edge: +(1 - a.sommaAskMedia).toFixed(4),
-      live: null,
-    }]);
-    if (error) console.error("insert:", error.message);
-    else console.log("scritto su Supabase");
-  }
+  console.log(`\n════ RIEPILOGO FINALE ════`);
+  console.log(`round registrati: ${risultati.length}`);
+  console.log(`COPPIA:   ${coppie.length}  → PnL garantito medio: ${coppie.length ? (coppie.reduce((t,r)=>t+(1-r.costo),0)/coppie.length).toFixed(3) : "n/d"}`);
+  console.log(`UN_LATO:  ${unLato.length}  → di cui vinti: ${soloUnoVinto}`);
+  console.log(`NESSUNO:  ${risultati.filter(r => r.esito === "NESSUNO").length}`);
 })();
