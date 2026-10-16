@@ -7,290 +7,208 @@ const supabase = createClient(
   { auth: { persistSession: false } }
 );
 
-const KALSHI = "https://external-api.kalshi.com/trade-api/v2";
 const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB = "https://clob.polymarket.com";
 
-// ── Matching severo ──────────────────────────────────────────────────────
-// Un accoppiamento è valido SOLO se TUTTE queste condizioni valgono:
-//   1. data di chiusura entro 1 giorno
-//   2. stesso tipo di evento (elezione, sport, cripto, economico...)
-//   3. overlap parole molto alto (>= 0.80)
-//   4. almeno 4 parole significative in comune
-//   5. stesso numero di "entità" rilevanti (città, candidati, soglie)
+const POLL_MS = 2000;
+const DURATA_MIN = 70;
 
-const STOP = new Set([
-  "will","the","a","an","in","on","of","to","be","is","are","was","were",
-  "by","at","for","and","or","before","after","end","yes","no","market",
-  "win","wins","than","more","less","this","that","which","who","what",
-  "when","before","during","over","under","above","below","between",
-  "any","all","other","new","next","last","first","second","third"
-]);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// Parole che indicano LUOGHI o PERSONE plurime → se il numero non
-// coincide tra le due domande, non sono lo stesso mercato.
-const CITY_HINT = /\b(chicago|detroit|los angeles|atlanta|houston|new york|phoenix|philadelphia|san antonio|san diego|dallas|austin|seattle|denver|boston|miami|portland|vegas|las vegas|nashville|memphis)\b/gi;
+// ── Trova il mercato BTC 5 minuti in corso ──────────────────────────────
+async function trovaMercato() {
+  const r = await fetch(`${GAMMA}/markets?closed=false&active=true&limit=500`);
+  if (!r.ok) throw new Error(`gamma HTTP ${r.status}`);
+  const j = await r.json();
+  const arr = Array.isArray(j) ? j : j.data || [];
+  console.log(`[gamma] ${arr.length} mercati attivi`);
 
-function terms(s) {
-  return new Set(
-    String(s || "").toLowerCase()
-      .replace(/[^a-z0-9\s]/g, " ")
-      .split(/\s+/)
-      .filter(w => w.length > 2 && !STOP.has(w))
-  );
-}
-
-function overlap(a, b) {
-  const A = terms(a), B = terms(b);
-  if (!A.size || !B.size) return { score: 0, comuni: 0 };
-  let hit = 0;
-  for (const w of A) if (B.has(w)) hit++;
-  return { score: hit / Math.min(A.size, B.size), comuni: hit };
-}
-
-// Conta le entità "geografiche" e le virgole: un mercato con 3 città
-// non può accoppiarsi con uno che ne ha 1.
-function entita(s) {
-  const t = String(s || "");
-  const citta = (t.match(CITY_HINT) || []).length;
-  const virgole = (t.match(/,/g) || []).length;
-  return { citta, virgole };
-}
-
-function tipoEvento(s) {
-  const t = String(s || "").toLowerCase();
-  if (/\b(bitcoin|btc|ethereum|eth|crypto|solana)\b/.test(t)) return "cripto";
-  if (/\b(election|president|senate|congress|governor|primary|nominee|democrat|republican)\b/.test(t)) return "elezione";
-  if (/\b(nba|nfl|mlb|nhl|super bowl|world series|match|game|championship|win the)\b/.test(t)) return "sport";
-  if (/\b(fed|rate|inflation|cpi|gdp|unemployment|recession)\b/.test(t)) return "economia";
-  if (/\b(temperature|hurricane|weather|storm)\b/.test(t)) return "meteo";
-  return "altro";
-}
-
-function giorniDistanza(a, b) {
-  const da = new Date(a).getTime();
-  const db = new Date(b).getTime();
-  if (!isFinite(da) || !isFinite(db)) return null;
-  return Math.abs(da - db) / 86400000;
-}
-
-// Il giudice finale. Ritorna null se non c'è match, altrimenti il punteggio.
-function matchValido(km, pm) {
-  // 1. data di chiusura
-  const dist = giorniDistanza(km.closeTime, pm.endDate);
-  if (dist === null || dist > 1) return null;
-
-  // 2. tipo di evento
-  if (tipoEvento(km.title) !== tipoEvento(pm.title)) return null;
-
-  // 3. + 4. testo: overlap alto E abbastanza parole in comune
-  const { score, comuni } = overlap(km.title, pm.title);
-  if (score < 0.80) return null;
-  if (comuni < 4) return null;
-
-  // 5. entità: stesso numero di città e di virgole
-  const ek = entita(km.title), ep = entita(pm.title);
-  if (ek.citta !== ep.citta) return null;
-  if (Math.abs(ek.virgole - ep.virgole) > 0) return null;
-
-  return { score, comuni, dist, tipo: tipoEvento(km.title) };
-}
-
-// ── Fetchers ─────────────────────────────────────────────────────────────
-
-async function fetchKalshi() {
-  const out = [];
-  let cursor = "";
-  for (let i = 0; i < 10; i++) {
-    const url = `${KALSHI}/markets?limit=1000`
-      + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
-    const r = await fetch(url);
-    if (!r.ok) { console.error(`[kalshi] HTTP ${r.status}`); break; }
-    const j = await r.json();
-    const page = j.markets || [];
-    out.push(...page);
-    cursor = j.cursor || "";
-    if (!cursor || !page.length) break;
-  }
-  console.log(`[kalshi] scaricati ${out.length} grezzi`);
-
-  const mapped = out.map(m => ({
-    src: "kalshi",
-    id: m.ticker,
-    title: m.title || m.yes_sub_title || m.ticker,
-    yesAsk: parseFloat(m.yes_ask_dollars),
-    noAsk: parseFloat(m.no_ask_dollars),
-    vol: parseFloat(m.volume_fp || 0),
-    closeTime: m.close_time,
-    status: m.status,
-    rules: (m.rules_primary || "").slice(0, 600),
-  }));
-
-  const aperti = mapped.filter(m => m.status === "open" || m.status === "active" || !m.status);
-  const conPrezzi = aperti.filter(m => isFinite(m.yesAsk) && isFinite(m.noAsk));
-  const passati = conPrezzi.filter(m =>
-    (m.yesAsk > 0.01 && m.yesAsk < 0.99) ||
-    (m.noAsk > 0.01 && m.noAsk < 0.99)
-  );
-  console.log(`[kalshi] utilizzabili: ${passati.length} (da ${aperti.length} aperti)`);
-  return passati;
-}
-
-async function fetchPolymarket() {
-  const out = [];
-  for (let off = 0; off < 5000; off += 100) {
-    const r = await fetch(`${GAMMA}/markets?closed=false&active=true&limit=100&offset=${off}`);
-    if (!r.ok) { console.error(`[poly] HTTP ${r.status}`); break; }
-    const j = await r.json();
-    const page = Array.isArray(j) ? j : j.data || [];
-    if (!page.length) break;
-    out.push(...page);
-    if (page.length < 100) break;
-  }
-  console.log(`[poly] scaricati ${out.length} grezzi`);
-
-  const aperti = out.filter(m => m.acceptingOrders === true);
-  const mapped = aperti.map(m => {
-    let tok = [];
-    try { tok = JSON.parse(m.clobTokenIds || "[]"); } catch {}
-    return {
-      src: "poly",
-      id: m.conditionId,
-      title: m.question,
-      yesToken: tok[0],
-      noToken: tok[1],
-      vol: parseFloat(m.volumeNum || 0),
-      endDate: m.endDate,
-      description: (m.description || "").slice(0, 400),
-    };
+  const cand = arr.filter(m => {
+    const s = (m.slug || "").toLowerCase();
+    const q = (m.question || "").toLowerCase();
+    return (s.includes("btc") && (s.includes("5m") || s.includes("5-min"))) ||
+           (q.includes("bitcoin") && q.includes("min"));
   });
-  const conToken = mapped.filter(m => m.yesToken && m.noToken);
-  console.log(`[poly] utilizzabili: ${conToken.length}`);
-  return conToken;
+
+  if (!cand.length) {
+    console.log(`[gamma] nessun BTC 5m trovato. Esempi di slug reali:`);
+    for (const m of arr.slice(0, 8)) console.log(`   ${m.slug}`);
+    return null;
+  }
+
+  console.log(`[gamma] ${cand.length} candidati BTC 5m`);
+
+  cand.sort((a, b) => new Date(a.endDate) - new Date(b.endDate));
+  const m = cand[0];
+
+  let tok = [], outs = [];
+  try { tok = JSON.parse(m.clobTokenIds || "[]"); } catch {}
+  try { outs = JSON.parse(m.outcomes || "[]"); } catch {}
+  if (tok.length < 2) {
+    console.log(`[gamma] token mancanti su ${m.slug}`);
+    return null;
+  }
+
+  const iUp = outs.findIndex(o => /up/i.test(o));
+  const iDn = outs.findIndex(o => /down/i.test(o));
+
+  console.log(`[gamma] round scelto: ${m.slug} | ${m.question} | chiude ${m.endDate}`);
+  console.log(`[gamma] outcomes: ${JSON.stringify(outs)}`);
+
+  return {
+    conditionId: m.conditionId,
+    question: m.question,
+    slug: m.slug,
+    endDate: m.endDate,
+    upToken: tok[iUp >= 0 ? iUp : 0],
+    downToken: tok[iDn >= 0 ? iDn : 1],
+  };
 }
 
-async function polyAsk(tokenId) {
-  if (!tokenId) return null;
+// ── Leggi il book completo (bid/ask/size) ───────────────────────────────
+async function leggiBook(tokenId) {
   try {
     const r = await fetch(`${CLOB}/book?token_id=${tokenId}`);
     if (!r.ok) return null;
     const j = await r.json();
-    const asks = (j.asks || [])
-      .map(a => parseFloat(a.price))
-      .filter(p => isFinite(p) && p > 0 && p < 1);
-    return asks.length ? Math.min(...asks) : null;
+    const bids = (j.bids || []).map(b => ({ p: parseFloat(b.price), s: parseFloat(b.size) }))
+      .filter(x => x.p > 0 && x.p < 1);
+    const asks = (j.asks || []).map(a => ({ p: parseFloat(a.price), s: parseFloat(a.size) }))
+      .filter(x => x.p > 0 && x.p < 1);
+    if (!bids.length || !asks.length) return null;
+    bids.sort((a, b) => b.p - a.p);
+    asks.sort((a, b) => a.p - b.p);
+
+    const sizeFino = (livelli, limite) =>
+      livelli.filter(l => l.p <= limite).reduce((t, l) => t + l.s, 0);
+
+    return {
+      bid: bids[0].p, bidSize: bids[0].s,
+      ask: asks[0].p, askSize: asks[0].s,
+      sizeAsk47: sizeFino(asks, 0.47),
+      sizeAsk48: sizeFino(asks, 0.48),
+      sizeAsk49: sizeFino(asks, 0.49),
+      spread: +(asks[0].p - bids[0].p).toFixed(4),
+    };
   } catch { return null; }
 }
 
-// ── Scan ─────────────────────────────────────────────────────────────────
+// ── Registra un round ───────────────────────────────────────────────────
+async function registraRound(mkt) {
+  const inizio = Date.now();
+  const fine = new Date(mkt.endDate).getTime();
+  console.log(`\n=== ${mkt.question} | chiude ${mkt.endDate} ===`);
 
-async function scanOnce() {
-  const [k, p] = await Promise.all([fetchKalshi(), fetchPolymarket()]);
-  console.log(`[scan] Kalshi ${k.length} | Polymarket ${p.length}`);
+  const righe = [];
+  let letture = 0;
 
-  // Indicizza Polymarket per data di chiusura (giorno) → candidati ridotti
-  const perGiorno = new Map();
-  for (const pm of p) {
-    const g = String(pm.endDate || "").slice(0, 10);
-    if (!g || g.length < 10) continue;
-    if (!perGiorno.has(g)) perGiorno.set(g, []);
-    perGiorno.get(g).push(pm);
-  }
+  while (Date.now() < fine && Date.now() - inizio < 6 * 60 * 1000) {
+    const rem = Math.max(0, (fine - Date.now()) / 60000);
+    const [bUp, bDn] = await Promise.all([
+      leggiBook(mkt.upToken),
+      leggiBook(mkt.downToken),
+    ]);
 
-  const hits = [];
-  let candidati = 0, accoppiate = 0;
-
-  for (const km of k) {
-    const gk = String(km.closeTime || "").slice(0, 10);
-    // cerca nello stesso giorno ± 1
-    const giorni = [gk];
-    const d = new Date(gk + "T00:00:00Z");
-    if (isFinite(d.getTime())) {
-      const avanti = new Date(d.getTime() + 86400000).toISOString().slice(0, 10);
-      const dietro = new Date(d.getTime() - 86400000).toISOString().slice(0, 10);
-      giorni.push(avanti, dietro);
-    }
-
-    let pool = [];
-    for (const g of giorni) pool.push(...(perGiorno.get(g) || []));
-    candidati += pool.length;
-
-    let best = null, bestInfo = null, bestScore = 0;
-    for (const pm of pool) {
-      const info = matchValido(km, pm);
-      if (!info) continue;
-      if (info.score > bestScore) { bestScore = info.score; best = pm; bestInfo = info; }
-    }
-    if (!best) continue;
-    accoppiate++;
-
-    const [pYes, pNo] = await Promise.all([polyAsk(best.yesToken), polyAsk(best.noToken)]);
-    if (pYes === null || pNo === null) continue;
-
-    const costA = km.yesAsk + pNo;
-    const costB = km.noAsk + pYes;
-    const cost = Math.min(costA, costB);
-    const leg = costA <= costB ? "K_YES + P_NO" : "K_NO + P_YES";
-
-    if (cost < 1.0) {
-      hits.push({
-        edge: 1 - cost, leg,
-        overlap: Math.round(bestScore * 100),
-        comuni: bestInfo.comuni, distGiorni: +bestInfo.dist.toFixed(2),
-        tipo: bestInfo.tipo,
-        kalshi_id: km.id, kalshi_title: km.title, kalshi_rules: km.rules,
-        kalshi_vol: km.vol, kalshi_close: km.closeTime,
-        poly_id: best.id, poly_title: best.title, poly_vol: best.vol,
-        cost: +cost.toFixed(4),
+    if (bUp && bDn) {
+      letture++;
+      righe.push({
+        rem: +rem.toFixed(2),
+        up_ask: bUp.ask, up_ask_size: bUp.askSize,
+        up_size47: bUp.sizeAsk47, up_size48: bUp.sizeAsk48,
+        up_bid: bUp.bid,
+        dn_ask: bDn.ask, dn_ask_size: bDn.askSize,
+        dn_size47: bDn.sizeAsk47, dn_size48: bDn.sizeAsk48,
+        dn_bid: bDn.bid,
       });
+
+      if (letture % 15 === 0) {
+        console.log(
+          `rem ${rem.toFixed(1)}' | UP ask ${bUp.ask} (size<=.47: ${bUp.sizeAsk47}) ` +
+          `| DN ask ${bDn.ask} (size<=.48: ${bDn.sizeAsk48})`
+        );
+      }
     }
+    await sleep(POLL_MS);
   }
 
-  console.log(`[scan] candidati per data: ${candidati}`);
-  console.log(`[scan] accoppiati (matching severo): ${accoppiate}`);
-  hits.sort((a, b) => b.edge - a.edge);
-  console.log(`[scan] edge < 1.00: ${hits.length}`);
-  if (hits[0]) {
-    console.log(`[scan] MIGLIORE: ${(hits[0].edge*100).toFixed(2)}% | ${hits[0].tipo} | ${hits[0].kalshi_title}`);
-  }
-
-  const top = hits.slice(0, 100);
-  if (top.length) {
-    const rows = top.map(h => ({
-      category: "cross-platform",
-      event_title: null,
-      market_title: `K: ${h.kalshi_title} || P: ${h.poly_title}`.slice(0, 900),
-      condition_id: h.poly_id,
-      signal_type: h.leg,
-      detail: [
-        `edge=${(h.edge * 100).toFixed(2)}%`,
-        `cost=${h.cost}`,
-        `overlap=${h.overlap}%`,
-        `parole_comuni=${h.comuni}`,
-        `dist_giorni=${h.distGiorni}`,
-        `tipo=${h.tipo}`,
-        `kalshi_ticker=${h.kalshi_id}`,
-        `kalshi_close=${h.kalshi_close}`,
-        `kalshi_vol=${h.kalshi_vol}`,
-        `poly_vol=${h.poly_vol}`,
-        `KALSHI_RULES: ${h.kalshi_rules}`,
-      ].join(" | "),
-      price_sum: h.cost,
-      edge: +h.edge.toFixed(4),
-      spread: null,
-      capital_needed: 0,
-      liquidity: h.kalshi_vol,
-      live: h.edge > 0.02,
-    }));
-    const { error } = await supabase.from("signals").insert(rows);
-    if (error) throw new Error(`insert: ${error.message}`);
-    console.log(`[scan] scritte ${rows.length} righe`);
-  } else {
-    console.log(`[scan] nessuna riga`);
-  }
+  console.log(`[round] ${letture} letture`);
+  return { righe, ticket: mkt };
 }
 
+// ── Analisi ─────────────────────────────────────────────────────────────
+function analizza(tutti) {
+  const flat = tutti.flatMap(r => r.righe);
+  if (!flat.length) return null;
+
+  const media = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
+  const mediana = a => {
+    const s = [...a].sort((x, y) => x - y);
+    return s[Math.floor(s.length / 2)];
+  };
+
+  const upAsk = flat.map(r => r.up_ask);
+  const dnAsk = flat.map(r => r.dn_ask);
+  const sommaAsk = flat.map(r => r.up_ask + r.dn_ask);
+
+  const entrambi4748 = flat.filter(r => r.up_ask <= 0.47 && r.dn_ask <= 0.48).length;
+  const entrambi4747 = flat.filter(r => r.up_ask <= 0.47 && r.dn_ask <= 0.47).length;
+  const entrambi4848 = flat.filter(r => r.up_ask <= 0.48 && r.dn_ask <= 0.48).length;
+
+  const sizeUp47 = flat.map(r => r.up_size47).filter(s => s > 0);
+  const sizeDn48 = flat.map(r => r.dn_size48).filter(s => s > 0);
+
+  return {
+    letture: flat.length,
+    round: tutti.length,
+    upAskMedio: +media(upAsk).toFixed(3),
+    dnAskMedio: +media(dnAsk).toFixed(3),
+    upAskMediano: +mediana(upAsk).toFixed(3),
+    dnAskMediano: +mediana(dnAsk).toFixed(3),
+    sommaAskMedia: +media(sommaAsk).toFixed(3),
+    sommaAskMediana: +mediana(sommaAsk).toFixed(3),
+    pctEntrambi4748: +(entrambi4748 / flat.length * 100).toFixed(1),
+    pctEntrambi4747: +(entrambi4747 / flat.length * 100).toFixed(1),
+    pctEntrambi4848: +(entrambi4848 / flat.length * 100).toFixed(1),
+    sizeMediaUp47: +media(sizeUp47).toFixed(1),
+    sizeMediaDn48: +media(sizeDn48).toFixed(1),
+  };
+}
+
+// ── Main ────────────────────────────────────────────────────────────────
 (async () => {
-  try { await scanOnce(); }
-  catch (e) { console.error("errore:", e); process.exit(1); }
+  const fine = Date.now() + DURATA_MIN * 60000;
+  const tutti = [];
+
+  while (Date.now() < fine) {
+    const mkt = await trovaMercato();
+    if (!mkt) {
+      console.log("riprovo tra 20s");
+      await sleep(20000);
+      continue;
+    }
+    try {
+      const r = await registraRound(mkt);
+      tutti.push(r);
+    } catch (e) {
+      console.error("errore round:", e.message);
+    }
+    await sleep(3000);
+  }
+
+  const a = analizza(tutti);
+  console.log("\n=== ANALISI ===");
+  console.log(JSON.stringify(a, null, 2));
+
+  if (a) {
+    const { error } = await supabase.from("signals").insert([{
+      category: "btc-book-test",
+      market_title: `Misurazione book ${a.round} round`,
+      signal_type: "book-misura",
+      detail: JSON.stringify(a),
+      edge: +(1 - a.sommaAskMedia).toFixed(4),
+      live: null,
+    }]);
+    if (error) console.error("insert:", error.message);
+    else console.log("scritto su Supabase");
+  }
 })();
