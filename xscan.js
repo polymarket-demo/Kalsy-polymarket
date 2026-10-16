@@ -16,16 +16,18 @@ const DURATA_MIN = 70;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ── Trova il round in corso ─────────────────────────────────────────────
+// ── Trova il round APPENA iniziato (salta quelli gia' avviati) ──────────
 async function trovaMercato() {
   const now = Math.floor(Date.now() / 1000);
   const base = Math.floor(now / 300) * 300;
 
   for (const off of [0, -300]) {
     const slug = `btc-updown-5m-${base + off}`;
-    const r = await fetch(`${GAMMA}/events?slug=${slug}`);
+    let r;
+    try { r = await fetch(`${GAMMA}/events?slug=${slug}`); } catch { continue; }
     if (!r.ok) continue;
-    const j = await r.json();
+    let j;
+    try { j = await r.json(); } catch { continue; }
     const evs = Array.isArray(j) ? j : j.data || [];
     if (!evs.length) continue;
 
@@ -40,11 +42,14 @@ async function trovaMercato() {
     const iUp = outs.findIndex(o => /up/i.test(o));
     const iDn = outs.findIndex(o => /down/i.test(o));
     const fine = new Date(m.endDate).getTime();
-    if (fine < Date.now()) continue;
+    const manca = (fine - Date.now()) / 60000;
 
-    console.log(`[gamma] ROUND ${m.slug} | chiude tra ${((fine - Date.now()) / 60000).toFixed(1)}'`);
+    // accetta solo il round APPENA iniziato (tra 4.6 e 5.4 minuti rimanenti)
+    if (manca < 4.6 || manca > 5.4) continue;
+
+    console.log(`[gamma] ROUND ${m.slug} | chiude tra ${manca.toFixed(1)}'`);
     return {
-      slug: m.slug, question: m.question, fine,
+      slug: m.slug, question: m.question, fine, conditionId: m.conditionId,
       upToken: tok[iUp >= 0 ? iUp : 0],
       downToken: tok[iDn >= 0 ? iDn : 1],
     };
@@ -74,20 +79,86 @@ async function book(tokenId) {
   } catch { return null; }
 }
 
+// ── Esito ufficiale letto da Gamma ──────────────────────────────────────
+async function esitoDaGamma(conditionId, slug) {
+  // 1) prova con l'evento
+  try {
+    const r = await fetch(`${GAMMA}/events?slug=${slug}`);
+    if (r.ok) {
+      const j = await r.json();
+      const evs = Array.isArray(j) ? j : j.data || [];
+      const m = ((evs[0] || {}).markets || [])[0];
+      if (m) {
+        // outcomePrices e' tipo "[\"1\", \"0\"]" → il primo e' UP, il secondo DOWN
+        let prices = [];
+        try { prices = JSON.parse(m.outcomePrices || "[]"); } catch {}
+        let outs = [];
+        try { outs = JSON.parse(m.outcomes || "[]"); } catch {}
+        if (prices.length === 2 && outs.length === 2) {
+          const iUp = outs.findIndex(o => /up/i.test(o));
+          const iDn = outs.findIndex(o => /down/i.test(o));
+          const pUp = parseFloat(prices[iUp >= 0 ? iUp : 0]);
+          const pDn = parseFloat(prices[iDn >= 0 ? iDn : 1]);
+          if (isFinite(pUp) && isFinite(pDn) && (pUp > 0.95 || pDn > 0.95)) {
+            return pUp > pDn ? "UP" : "DOWN";
+          }
+        }
+      }
+    }
+  } catch {}
+
+  // 2) fallback: chiedi il mercato per conditionId
+  if (conditionId) {
+    try {
+      const r = await fetch(`${GAMMA}/markets?condition_ids=${conditionId}`);
+      if (r.ok) {
+        const j = await r.json();
+        const arr = Array.isArray(j) ? j : j.data || [];
+        const m = arr[0];
+        if (m) {
+          let prices = [];
+          try { prices = JSON.parse(m.outcomePrices || "[]"); } catch {}
+          let outs = [];
+          try { outs = JSON.parse(m.outcomes || "[]"); } catch {}
+          if (prices.length === 2 && outs.length === 2) {
+            const iUp = outs.findIndex(o => /up/i.test(o));
+            const iDn = outs.findIndex(o => /down/i.test(o));
+            const pUp = parseFloat(prices[iUp >= 0 ? iUp : 0]);
+            const pDn = parseFloat(prices[iDn >= 0 ? iDn : 1]);
+            if (isFinite(pUp) && isFinite(pDn) && (pUp > 0.95 || pDn > 0.95)) {
+              return pUp > pDn ? "UP" : "DOWN";
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+  return "?";
+}
+
 // ── Registra un round ───────────────────────────────────────────────────
 async function registraRound(mkt) {
   console.log(`\n=== ${mkt.slug} | ${mkt.question} ===`);
 
-  let letture = 0;
-  let upTocco = null;   // { px, rem, size }
+  let lettureOk = 0;
+  let lettureVuote = 0;      // book risposto ma vuoto
+  let lettureErrore = 0;     // fetch fallita
+  let upTocco = null;
   let dnTocco = null;
+  let minUp = 99, minDn = 99;
 
   while (Date.now() < mkt.fine) {
     const rem = Math.max(0, (mkt.fine - Date.now()) / 60000);
-    const [bUp, bDn] = await Promise.all([book(mkt.upToken), book(mkt.downToken)]);
+    let bUp = null, bDn = null;
+    try {
+      [bUp, bDn] = await Promise.all([book(mkt.upToken), book(mkt.downToken)]);
+    } catch { lettureErrore++; await sleep(POLL_MS); continue; }
 
-    if (bUp && bDn && bUp.ask !== null && bDn.ask !== null) {
-      letture++;
+    if (bUp === null || bDn === null) { lettureVuote++; }
+    else if (bUp.ask !== null && bDn.ask !== null) {
+      lettureOk++;
+      if (bUp.ask < minUp) minUp = bUp.ask;
+      if (bDn.ask < minDn) minDn = bDn.ask;
 
       if (!upTocco && bUp.ask <= SOGLIA) {
         upTocco = { px: bUp.ask, rem, size: bUp.size47 };
@@ -98,60 +169,42 @@ async function registraRound(mkt) {
         console.log(`  DOWN tocca ${SOGLIA} a ${rem.toFixed(2)}' (ask ${bDn.ask}, size ${bDn.size47.toFixed(0)})`);
       }
 
-      if (letture % 40 === 1) {
-        console.log(`  rem ${rem.toFixed(1)}' | UP ${bUp.ask} | DN ${bDn.ask}`);
+      if (lettureOk % 40 === 1) {
+        console.log(`  rem ${rem.toFixed(1)}' | UP ${bUp.ask} | DN ${bDn.ask} | ok ${lettureOk} vuote ${lettureVuote}`);
       }
     }
     await sleep(POLL_MS);
   }
 
-  // ── ESITO: chi ha vinto (letto dal book a round chiuso) ──
-  let vincitore = "?";
-  let fUp = null, fDn = null;
-  try {
-    const [a, b] = await Promise.all([book(mkt.upToken), book(mkt.downToken)]);
-    fUp = a; fDn = b;
-    if (a && b && a.bid !== null && b.bid !== null) {
-      vincitore = a.bid > b.bid ? "UP" : "DOWN";
-    }
-  } catch {}
+  // ── esito ufficiale ──
+  const vincitore = await esitoDaGamma(mkt.conditionId, mkt.slug);
 
-  // ── Chi ha toccato per primo, e l'altro è salito diretto? ──
-  let primo = null, secondo = null, salitoDiretto = null;
-
-  if (upTocco && dnTocco) {
-    // tocca prima chi ha rem maggiore (piu' minuti residui = piu' presto)
-    primo = upTocco.rem > dnTocco.rem ? "UP" : "DOWN";
-    secondo = primo === "UP" ? "DOWN" : "UP";
-  } else if (upTocco) {
-    primo = "UP"; salitoDiretto = "DOWN";
-  } else if (dnTocco) {
-    primo = "DOWN"; salitoDiretto = "UP";
-  }
+  // ── chi ha toccato per primo ──
+  let primo = null, salitoDiretto = null;
+  if (upTocco && dnTocco) primo = upTocco.rem > dnTocco.rem ? "UP" : "DOWN";
+  else if (upTocco) { primo = "UP"; salitoDiretto = "DOWN"; }
+  else if (dnTocco) { primo = "DOWN"; salitoDiretto = "UP"; }
 
   const esito = upTocco && dnTocco ? "COPPIA"
-              : (upTocco || dnTocco ? "UN_LATO" : "NESSUNO");
+              : (upTocco || dnTocco ? "UN_LATO" : "NIENTE_LETTURE");
   const costo = upTocco && dnTocco ? upTocco.px + dnTocco.px : null;
-
-  // il mio lato è il PRIMO che scende (compro quello)
   const mioLato = primo;
   const ioVinto = (mioLato && vincitore !== "?") ? mioLato === vincitore : null;
 
   console.log(`\n>>> ROUND ${mkt.slug}`);
-  console.log(`    letture: ${letture}`);
-  console.log(`    UP   tocca ${SOGLIA}: ${upTocco ? upTocco.px + " @ " + upTocco.rem.toFixed(2) + "min" : "NO"}`);
-  console.log(`    DOWN tocca ${SOGLIA}: ${dnTocco ? dnTocco.px + " @ " + dnTocco.rem.toFixed(2) + "min" : "NO"}`);
+  console.log(`    letture ok: ${lettureOk} | vuote: ${lettureVuote} | errori: ${lettureErrore}`);
+  console.log(`    UP   tocca ${SOGLIA}: ${upTocco ? upTocco.px + " @ " + upTocco.rem.toFixed(2) + "min" : "NO"} (minimo ${minUp === 99 ? "-" : minUp})`);
+  console.log(`    DOWN tocca ${SOGLIA}: ${dnTocco ? dnTocco.px + " @ " + dnTocco.rem.toFixed(2) + "min" : "NO"} (minimo ${minDn === 99 ? "-" : minDn})`);
   console.log(`    PRIMO: ${primo || "nessuno"}${salitoDiretto ? ` | ${salitoDiretto} è SALITO senza scendere` : ""}`);
   console.log(`    ESITO: ${esito}${costo ? " | costo " + costo.toFixed(2) + " | PnL " + (1 - costo).toFixed(2) : ""}`);
-  console.log(`    VINCE: ${vincitore} (UP bid ${fUp ? fUp.bid : "?"} / DN bid ${fDn ? fDn.bid : "?"})`);
-  if (mioLato && ioVinto !== null) {
-    console.log(`    IL MIO LATO (${mioLato}) → ${ioVinto ? "VINTO ✓" : "PERSO ✗"}`);
-  }
+  console.log(`    VINCE: ${vincitore}`);
+  if (mioLato && ioVinto !== null) console.log(`    IL MIO LATO (${mioLato}) → ${ioVinto ? "VINTO" : "PERSO"}`);
   console.log(`<<<\n`);
 
   return {
-    slug: mkt.slug, letture, esito, upTocco, dnTocco, costo,
-    vincitore, primo, salitoDiretto, mioLato, ioVinto,
+    slug: mkt.slug, question: mkt.question, esito, costo,
+    upTocco, dnTocco, primo, salitoDiretto, vincitore, mioLato, ioVinto,
+    lettureOk, lettureVuote, lettureErrore, minUp: minUp === 99 ? null : minUp, minDn: minDn === 99 ? null : minDn,
   };
 }
 
@@ -163,7 +216,14 @@ async function registraRound(mkt) {
 
   while (Date.now() < fine) {
     const mkt = await trovaMercato();
-    if (!mkt) { console.log("riprovo tra 15s"); await sleep(15000); continue; }
+    if (!mkt) {
+      const now = Math.floor(Date.now() / 1000);
+      const prox = (Math.floor(now / 300) + 1) * 300 + 3;
+      const attesa = Math.max(3000, (prox - now) * 1000);
+      console.log(`[main] nessun round appena iniziato, attendo ${(attesa / 1000).toFixed(0)}s`);
+      await sleep(attesa);
+      continue;
+    }
     if (fatti.has(mkt.slug)) { await sleep(15000); continue; }
 
     try {
@@ -174,33 +234,38 @@ async function registraRound(mkt) {
       await supabase.from("signals").insert([{
         category: "btc-maker-test",
         market_title: r.slug,
+        condition_id: r.conditionId || null,
         signal_type: r.esito,
         detail: JSON.stringify({
           up: r.upTocco, dn: r.dnTocco, costo: r.costo,
           primo: r.primo, salitoDiretto: r.salitoDiretto,
           vince: r.vincitore, mioLato: r.mioLato, ioVinto: r.ioVinto,
+          lettureOk: r.lettureOk, lettureVuote: r.lettureVuote, lettureErrore: r.lettureErrore,
+          minUp: r.minUp, minDn: r.minDn,
         }),
         edge: r.costo ? +(1 - r.costo).toFixed(4) : null,
         live: r.esito === "COPPIA",
       }]);
     } catch (e) {
-      console.error("errore:", e.message);
+      console.error("errore round:", e.message);
     }
 
     const now = Math.floor(Date.now() / 1000);
-    const prox = (Math.floor(now / 300) + 1) * 300;
-    await sleep(Math.max(1000, (prox - now) * 1000 + 2000));
+    const prox = (Math.floor(now / 300) + 1) * 300 + 3;
+    await sleep(Math.max(2000, (prox - now) * 1000));
   }
 
   // ── RIEPILOGO FINALE ──
   const coppie = risultati.filter(r => r.esito === "COPPIA");
   const unLato = risultati.filter(r => r.esito === "UN_LATO");
-  const unLatoVinti = unLato.filter(r => r.ioVinto === true).length;
-  const pnlCoppie = coppie.reduce((t, r) => t + (1 - r.costo), 0);
+  const vinti = unLato.filter(r => r.ioVinto === true).length;
+  const pnl = coppie.reduce((t, r) => t + (1 - r.costo), 0);
+  const costoMedio = coppie.length ? coppie.reduce((t, r) => t + r.costo, 0) / coppie.length : 0;
 
   console.log(`\n════ RIEPILOGO FINALE ════`);
-  console.log(`round: ${risultati.length}`);
-  console.log(`COPPIA:  ${coppie.length}  → PnL medio ${coppie.length ? (pnlCoppie / coppie.length).toFixed(3) : "n/d"} | totale ${pnlCoppie.toFixed(2)}`);
-  console.log(`UN_LATO: ${unLato.length}  → di cui il PRIMO lato ha vinto: ${unLatoVinti}`);
-  console.log(`NESSUNO: ${risultati.filter(r => r.esito === "NESSUNO").length}`);
+  console.log(`round registrati: ${risultati.length}`);
+  console.log(`COPPIA:  ${coppie.length} | costo medio ${costoMedio.toFixed(3)} | PnL medio ${coppie.length ? (pnl / coppie.length).toFixed(3) : "-"} | PnL totale ${pnl.toFixed(2)}`);
+  console.log(`UN_LATO: ${unLato.length} | di cui il lato comprato ha vinto: ${vinti}`);
+  console.log(`NIENTE_LETTURE: ${risultati.filter(r => r.esito === "NIENTE_LETTURE").length}`);
+  console.log(`TOTALE round: ${risultati.length}`);
 })();
