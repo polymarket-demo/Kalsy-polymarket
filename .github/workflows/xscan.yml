@@ -18,6 +18,3 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           POLYMARKET_FUNDER: ${{ secrets.POLYMARKET_FUNDER }}
-          POLY_API_KEY: ${{ secrets.POLY_API_KEY }}
-          POLY_API_SECRET: ${{ secrets.POLY_API_SECRET }}
-          POLY_API_PASSPHRASE: ${{ secrets.POLY_API_PASSPHRASE }}
