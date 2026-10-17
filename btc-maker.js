@@ -29,7 +29,17 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 function clob() {
   const w = new ethers.Wallet(process.env.PRIVATE_KEY);
   console.log(`[wallet] firmatario: ${w.address}`);
-  return new ClobClient(CLOB, CHAIN, w);
+
+  const creds = {
+    key:        process.env.POLY_API_KEY        || "",
+    secret:     process.env.POLY_API_SECRET     || "",
+    passphrase: process.env.POLY_API_PASSPHRASE || "",
+  };
+
+  const cli = new ClobClient(CLOB, CHAIN, w, creds);
+  console.log(`[lib] client.address: ${cli.address || cli.funderAddress || "NESSUNO"}`);
+  console.log(`[lib] client.creds: ${cli.creds ? "presenti" : "assenti"}`);
+  return cli;
 }
 
 async function trovaRound() {
@@ -187,34 +197,6 @@ async function giocaRound(cli, mkt) {
 }
 
 (async () => {
-
-  // ═══════════════════════════════════════════════════════════
-  //  PASSO 1 — GENERATORE CREDENZIALI (temporaneo)
-  //  Stampa le 3 credenziali e si ferma. Quando le hai messe
-  //  nei secret, togli questo blocco e il "return" qui sotto.
-  // ═══════════════════════════════════════════════════════════
-  const w0 = new ethers.Wallet(process.env.PRIVATE_KEY);
-  console.log(`firmatario: ${w0.address}`);
-  const tmp = new ClobClient(CLOB, CHAIN, w0);
-
-  for (const n of ["createApiKey", "createOrDeriveApiCreds", "deriveApiKey"]) {
-    if (typeof tmp[n] === "function") {
-      try {
-        const c = await tmp[n]();
-        console.log("════ CREDENZIALI ════");
-        console.log(`KEY=${c.key}`);
-        console.log(`SECRET=${c.secret}`);
-        console.log(`PASSPHRASE=${c.passphrase}`);
-        console.log("═════════════════════");
-        return;
-      } catch (e) {
-        console.log(`${n}() fallito: ${e.message}`);
-      }
-    }
-  }
-  console.log("nessun generatore riuscito");
-  // ═══════════════ FINE PASSO 1 ═══════════════
-
   const cli = clob();
 
   const fine = Date.now() + DURATA_MIN * 60000;
