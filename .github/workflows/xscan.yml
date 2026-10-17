@@ -11,7 +11,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: npm install @polymarket/clob-client@4.11.0 ethers @supabase/supabase-js dotenv
+      - run: npm install @polymarket/clob-client@4.11.0 ethers@5.7.2 @supabase/supabase-js dotenv
       - run: node btc-maker.js
         env:
           PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
