@@ -23,8 +23,6 @@ const POLL_MS     = 1500;
 const DURATA_MIN  = 70;
 const FEE_CRYPTO  = 0.07;
 const FEE_BPS     = 1000;
-
-// MetaMask = wallet EOA → signatureType 0, funder = stesso indirizzo
 const SIGNATURE_TYPE = 0;
 const FUNDER = "0xaD6A5E97Ed597BEE1556aCD5A2148dc1fa89a244";
 
@@ -33,11 +31,15 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 function clob() {
   const w = new ethers.Wallet(process.env.PRIVATE_KEY);
   console.log(`[wallet] firmatario: ${w.address}`);
-  console.log(`[wallet] funder: ${FUNDER}`);
 
-  const cli = new ClobClient(CLOB, CHAIN, w, undefined, SIGNATURE_TYPE, FUNDER);
-  console.log(`[lib] client.address: ${cli.address || cli.funderAddress || "NESSUNO"}`);
-  return cli;
+  const creds = {
+    key:        process.env.POLY_API_KEY,
+    secret:     process.env.POLY_API_SECRET,
+    passphrase: process.env.POLY_API_PASSPHRASE,
+  };
+  console.log(`[auth] creds key: ${creds.key ? creds.key.slice(0, 8) + "..." : "MANCANTE"}`);
+
+  return new ClobClient(CLOB, CHAIN, w, creds, SIGNATURE_TYPE, FUNDER);
 }
 
 async function trovaRound() {
