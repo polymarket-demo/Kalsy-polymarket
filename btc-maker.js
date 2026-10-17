@@ -1,4 +1,5 @@
 require("dotenv").config();
+
 const { createClient } = require("@supabase/supabase-js");
 const { ClobClient, Side, OrderType } = require("@polymarket/clob-client");
 const { ethers } = require("ethers");
@@ -21,13 +22,20 @@ const STOP_SELL   = 0.35;
 const POLL_MS     = 1500;
 const DURATA_MIN  = 70;
 const FEE_CRYPTO  = 0.07;
-const FEE_BPS     = 1000;    // fee rate richiesta dal mercato (obbligatoria in firma)
+const FEE_BPS     = 1000;
+
+// ── AUTH: account email/Magic (proxy wallet) ────────────────────────────
+const SIGNATURE_TYPE = 1;
+const FUNDER         = process.env.POLYMARKET_FUNDER;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function clob() {
   const w = new ethers.Wallet(process.env.PRIVATE_KEY);
-  return new ClobClient(CLOB, CHAIN, w);
+  console.log(`[wallet] firmatario: ${w.address}`);
+  console.log(`[wallet] funder:     ${FUNDER}`);
+  console.log(`[wallet] signatureType: ${SIGNATURE_TYPE}`);
+  return new ClobClient(CLOB, CHAIN, w, undefined, SIGNATURE_TYPE, FUNDER);
 }
 
 async function trovaRound() {
@@ -39,7 +47,8 @@ async function trovaRound() {
     let r;
     try { r = await fetch(`${GAMMA}/events?slug=${slug}`); } catch { continue; }
     if (!r.ok) continue;
-    let j; try { j = await r.json(); } catch { continue; }
+    let j;
+    try { j = await r.json(); } catch { continue; }
     const evs = Array.isArray(j) ? j : j.data || [];
     if (!evs.length) continue;
 
