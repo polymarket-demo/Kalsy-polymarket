@@ -27,7 +27,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function clob() {
   const w = new ethers.Wallet(process.env.PRIVATE_KEY);
-  return new ClobClient(CLOB, CHAIN, w, undefined, undefined, 0, w.address);
+  return new ClobClient(CLOB, CHAIN, w);
 }
 
 async function trovaRound() {
