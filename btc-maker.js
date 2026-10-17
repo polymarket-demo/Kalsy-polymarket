@@ -31,11 +31,26 @@ const FUNDER         = process.env.POLYMARKET_FUNDER;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function clob() {
+  // versione della libreria installata
+  try {
+    const pkg = require("@polymarket/clob-client/package.json");
+    console.log(`[lib] clob-client versione: ${pkg.version}`);
+  } catch (e) {
+    console.log(`[lib] versione non leggibile: ${e.message}`);
+  }
+
   const w = new ethers.Wallet(process.env.PRIVATE_KEY);
   console.log(`[wallet] firmatario: ${w.address}`);
-  console.log(`[wallet] funder:     ${FUNDER}`);
+  console.log(`[wallet] funder: ${FUNDER}`);
   console.log(`[wallet] signatureType: ${SIGNATURE_TYPE}`);
-  return new ClobClient(CLOB, CHAIN, w, undefined, SIGNATURE_TYPE, FUNDER);
+
+  const cli = new ClobClient(CLOB, CHAIN, w, undefined, SIGNATURE_TYPE, FUNDER);
+
+  // cosa vede davvero il client
+  console.log(`[lib] client.address: ${cli.address || cli.funderAddress || cli.signerAddress || "NESSUNO"}`);
+  console.log(`[lib] client.signer: ${cli.signer ? "presente" : "assente"}`);
+  console.log(`[lib] chiavi client: ${Object.keys(cli).slice(0, 25).join(",")}`);
+  return cli;
 }
 
 async function trovaRound() {
@@ -131,6 +146,7 @@ async function annulla(cli, orderId) {
 }
 
 async function preparaAuth(cli) {
+  // 1) prova i derivatori
   const nomi = ["createOrDeriveApiCreds", "deriveApiCreds", "deriveApiKey", "createApiKey", "setApiCreds"];
   for (const nome of nomi) {
     if (typeof cli[nome] === "function") {
@@ -138,7 +154,21 @@ async function preparaAuth(cli) {
       catch (e) { console.log(`[auth] ${nome}() fallito: ${e.message}`); }
     }
   }
-  console.log("[auth] nessun derivatore — procedo con la firma del wallet");
+  console.log("[auth] nessun derivatore riuscito");
+
+  // 2) API key da env, se presenti
+  const key = process.env.POLY_API_KEY;
+  const secret = process.env.POLY_API_SECRET;
+  const pass = process.env.POLY_API_PASSPHRASE;
+  if (key && secret && pass) {
+    try {
+      cli.creds = { key, secret, passphrase: pass };
+      if (typeof cli.setApiCreds === "function") cli.setApiCreds({ key, secret, passphrase: pass });
+      console.log("[auth] credenziali impostate da env");
+      return;
+    } catch (e) { console.log(`[auth] set creds fallito: ${e.message}`); }
+  }
+  console.log("[auth] procedo senza credenziali API esplicite");
 }
 
 async function giocaRound(cli, mkt) {
