@@ -10,10 +10,15 @@ const supabase = createClient(
 const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB  = "https://clob.polymarket.com";
 
-const POLL_MS     = 1500;
-const SOGLIA      = 0.47;
-const DURATA_MIN  = 70;
-const FEE_CRYPTO  = 0.07;
+const POLL_MS      = 1500;
+const SOGLIA       = 0.47;
+const DURATA_MIN   = 70;
+const FEE_CRYPTO   = 0.07;
+
+// --- RETRY ESITO -------------------------------------------------------------
+const ESITO_RETRY_MS  = 12000;  // attesa prima del 2o tentativo
+const ESITO_RETRY_2MS = 45000;  // attesa prima del 3o tentativo
+const ESITO_DIFF_MIN  = 0.90;   // |pUp - pDn| minimo per dichiarare un esito
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -95,30 +100,54 @@ async function infoMercato(conditionId) {
   } catch { return null; }
 }
 
+// --- ESITO (una lettura) -----------------------------------------------------
+// Ritorna { vince, pUp, pDn } oppure null se i prezzi non sono ancora decisivi.
+function leggiEsito(m) {
+  if (!m) return null;
+  let prices = [], outs = [];
+  try { prices = JSON.parse(m.outcomePrices || "[]"); } catch {}
+  try { outs = JSON.parse(m.outcomes || "[]"); } catch {}
+  if (prices.length !== 2 || outs.length !== 2) return null;
+
+  const iUp = outs.findIndex(o => /up/i.test(o));
+  const iDn = outs.findIndex(o => /down/i.test(o));
+  const pUp = parseFloat(prices[iUp >= 0 ? iUp : 0]);
+  const pDn = parseFloat(prices[iDn >= 0 ? iDn : 1]);
+  if (!isFinite(pUp) || !isFinite(pDn)) return null;
+
+  if (pUp > 0.95 || pDn > 0.95 || Math.abs(pUp - pDn) > ESITO_DIFF_MIN) {
+    return { vince: pUp > pDn ? "UP" : "DOWN", pUp, pDn };
+  }
+  return { vince: null, pUp, pDn };     // letto, ma non ancora decisivo
+}
+
 async function esitoDaGamma(conditionId, slug) {
   try {
     const r = await fetch(`${GAMMA}/events?slug=${slug}`);
-    if (r.ok) {
-      const j = await r.json();
-      const evs = Array.isArray(j) ? j : j.data || [];
-      const m = ((evs[0] || {}).markets || [])[0];
-      if (m) {
-        let prices = [], outs = [];
-        try { prices = JSON.parse(m.outcomePrices || "[]"); } catch {}
-        try { outs = JSON.parse(m.outcomes || "[]"); } catch {}
-        if (prices.length === 2 && outs.length === 2) {
-          const iUp = outs.findIndex(o => /up/i.test(o));
-          const iDn = outs.findIndex(o => /down/i.test(o));
-          const pUp = parseFloat(prices[iUp >= 0 ? iUp : 0]);
-          const pDn = parseFloat(prices[iDn >= 0 ? iDn : 1]);
-          if (isFinite(pUp) && isFinite(pDn) && (pUp > 0.95 || pDn > 0.95)) {
-            return pUp > pDn ? "UP" : "DOWN";
-          }
-        }
-      }
+    if (!r.ok) return null;
+    const j = await r.json();
+    const evs = Array.isArray(j) ? j : j.data || [];
+    const m = ((evs[0] || {}).markets || [])[0];
+    return leggiEsito(m);
+  } catch { return null; }
+}
+
+// Con retry: il mercato appena chiuso spesso non ha ancora i prezzi finali.
+// Non blocchiamo a lungo: se il round successivo è già partito, ci arrendiamo.
+async function esitoConRetry(conditionId, slug, scadenza) {
+  const attese = [0, ESITO_RETRY_MS, ESITO_RETRY_2MS];
+  let ultimo = null;
+  for (const attesa of attese) {
+    if (attesa > 0) {
+      // non sforare l'ingresso del round successivo
+      if (Date.now() + attesa > scadenza) break;
+      await sleep(attesa);
     }
-  } catch {}
-  return "?";
+    const e = await esitoDaGamma(conditionId, slug);
+    if (e) ultimo = e;
+    if (e && e.vince) return e;
+  }
+  return ultimo;   // può avere vince=null: prezzi letti ma non decisivi
 }
 
 async function registraRound(mkt) {
@@ -183,7 +212,13 @@ async function registraRound(mkt) {
     await sleep(POLL_MS);
   }
 
-  const vincitore = await esitoDaGamma(mkt.conditionId, mkt.slug);
+  // --- ESITO con retry (non sfora l'ingresso del round successivo)
+  const prossimoRound = mkt.fine + 300000;   // fine + 5 min
+  const scadenza = Math.min(prossimoRound - 45000, mkt.fine + 120000);
+  const lettura = await esitoConRetry(mkt.conditionId, mkt.slug, scadenza);
+  const vincitore = lettura && lettura.vince ? lettura.vince : "?";
+  const prezziEsito = lettura ? `${lettura.pUp}/${lettura.pDn}` : "-";
+
   const fr = await infoMercato(mkt.conditionId);
 
   let primo = null, salitoDiretto = null;
@@ -220,7 +255,7 @@ async function registraRound(mkt) {
   console.log(`    DOWN tocca ${SOGLIA}: ${dnTocco ? dnTocco.px + " @" + dnTocco.rem.toFixed(2) + "'" : "NO"} (min ${minDn === 99 ? "-" : minDn})`);
   console.log(`    PRIMO: ${primo || "nessuno"}${salitoDiretto ? ` | ${salitoDiretto} è SALITO` : ""}`);
   console.log(`    ESITO: ${esito}${costo ? ` | costo ${costo.toFixed(2)}` : ""}`);
-  console.log(`    VINCE: ${vincitore}`);
+  console.log(`    VINCE: ${vincitore}${vincitore === "?" ? ` (prezzi ${prezziEsito}, non decisivi)` : ` (prezzi ${prezziEsito})`}`);
   console.log(`    MAKER? UP ${upMaker ? "SI" : "NO"} | DN ${dnMaker ? "SI" : "NO"}`);
   if (pnlLordo !== null) console.log(`    PnL: lordo ${pnlLordo} | fee ${fee} | NETTO ${pnlNetto}`);
   console.log(`    SIZE MAX sotto 0.47: UP ${maxSizeUp47.toFixed(0)} | DN ${maxSizeDn47.toFixed(0)}`);
@@ -228,12 +263,14 @@ async function registraRound(mkt) {
     console.log(`    STOP: sotto 0.35 a ${mio35 === null ? "MAI" : mio35.toFixed(2) + "'"} | sotto 0.30 a ${mio30 === null ? "MAI" : mio30.toFixed(2) + "'"}`);
   }
   if (mioLato && ioVinto !== null) console.log(`    IL MIO LATO (${mioLato}) → ${ioVinto ? "VINTO" : "PERSO"}`);
+  else if (mioLato) console.log(`    IL MIO LATO (${mioLato}) → ESITO IGNOTO (escluso dal conteggio)`);
   if (fr) console.log(`    MARKET: minSize ${fr.minSize} | fee ${fr.makerFee}/${fr.takerFee} | pool ${fr.rewards ? JSON.stringify(fr.rewards) : "nessuna"}`);
   console.log(`<<<\n`);
 
   return {
     slug: mkt.slug, esito, costo, pnlLordo, fee, pnlNetto,
     upTocco, dnTocco, primo, salitoDiretto, vincitore, mioLato, ioVinto,
+    prezziEsito,
     lettureOk, vuote, errori,
     minUp: minUp === 99 ? null : minUp, minDn: minDn === 99 ? null : minDn,
     mio35, mio30, apertura, upMaker, dnMaker,
@@ -265,6 +302,7 @@ async function registraRound(mkt) {
           up: r.upTocco, dn: r.dnTocco, costo: r.costo,
           pnlLordo: r.pnlLordo, fee: r.fee, pnlNetto: r.pnlNetto,
           primo: r.primo, vince: r.vincitore, mioLato: r.mioLato, ioVinto: r.ioVinto,
+          prezziEsito: r.prezziEsito,
           apertura: r.apertura, upMaker: r.upMaker, dnMaker: r.dnMaker,
           maxSizeUp47: r.maxSizeUp47, maxSizeDn47: r.maxSizeDn47, sizeAlTocco: r.sizeAlTocco,
           stop35: r.mio35, stop30: r.mio30,
@@ -291,6 +329,7 @@ async function registraRound(mkt) {
     if (attesa > 0) await sleep(attesa);
   }
 
+  // --- RIEPILOGO -------------------------------------------------------------
   const coppie = risultati.filter(r => r.esito === "COPPIA");
   const unLato = risultati.filter(r => r.esito === "UN_LATO");
   const lordo = coppie.reduce((t, r) => t + (r.pnlLordo || 0), 0);
@@ -299,8 +338,22 @@ async function registraRound(mkt) {
   const sizeMed = coppie.length
     ? coppie.reduce((t, r) => t + (r.maxSizeUp47 || 0), 0) / coppie.length : 0;
 
+  // Win rate sul lato scelto (solo round con esito verificabile)
+  const noti  = risultati.filter(r => r.mioLato && r.vincitore !== "?");
+  const vinti = noti.filter(r => r.ioVinto === true).length;
+  const perc  = noti.length ? (vinti / noti.length * 100).toFixed(0) : "0";
+
+  // Quanti lato-UP e lato-DN sono stati scelti, e come sono andati
+  const perLato = (L) => {
+    const s = noti.filter(r => r.mioLato === L);
+    const v = s.filter(r => r.ioVinto === true).length;
+    return `${L}: ${v}/${s.length}`;
+  };
+
   console.log(`\n════ RIEPILOGO ════`);
   console.log(`round: ${risultati.length} | COPPIA ${coppie.length} | UN_LATO ${unLato.length}`);
-  console.log(`PnL LORDO ${lordo.toFixed(3)} | FEE ${feeT.toFixed(3)} | NETTO ${netto.toFixed(3)} | per round ${(netto / Math.max(1, risultati.length)).toFixed(4)}`);
+  console.log(`PnL LORDO ${lordo.toFixed(3)} | FEE ${feeT.toFixed(3)} | NETTO ${netto.toFixed(3)} | per round ${(coppie.length ? netto / coppie.length : 0).toFixed(4)}`);
+  console.log(`LATO: ${vinti}/${noti.length} vinti (${perc}%) | ${perLato("UP")} | ${perLato("DOWN")} | esclusi (esito ignoto): ${risultati.length - noti.length}`);
   console.log(`size media sotto 0.47 sul lato UP: ${sizeMed.toFixed(0)} share`);
+  console.log(`════════════════════\n`);
 })();
