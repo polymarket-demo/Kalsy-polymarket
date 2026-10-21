@@ -1,359 +1,294 @@
-require("dotenv").config();
-const { createClient } = require("@supabase/supabase-js");
+// ═══════════════════════════════════════════════════════════════════════════
+// xsignal.js — MISURA + SEGNALI (NESSUN ORDINE, SOLO DATI)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// REGOLA MISURATA SUI DATI (non stimata):
+//   quota 0,44 su UP e DN (5 share = 2,20 $ per lato, coppia 4,40 $)
+//   coppia chiusa  -> 5,00 incassati -> +0,60 $
+//   stop a 0,35    -> -0,45 $
+//
+//   NON si aspetta un tempo fisso: si aspetta finche' il LATO COMPRATO
+//   resta >= 0,35. In pratica decide a 25-30 secondi.
+//   A quel punto:
+//     perdente < 0,35  E  vincente <= 0,70  ->  ROTAZIONE
+//     altrimenti                            ->  STOP a 0,35
+//
+// Test sui dati (4 round a un lato): stop -1,80 $ vs rotazione +4,55/+5,60 $.
+//
+// NON piazza ordini. Non usa chiavi private. Non tocca l'API di trading.
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  { auth: { persistSession: false } }
-);
+import WebSocket from "ws";
+import fs from "fs";
+import path from "path";
 
-const GAMMA = "https://gamma-api.polymarket.com";
-const CLOB  = "https://clob.polymarket.com";
+const CFG = {
+  QUOTA: 0.44,            // quota base su UP e DN
+  SHARES: 5,              // share per lato
+  STOP: 0.35,             // stop sul lato scoperto
+  SOGLIA_PERDENTE: 0.35,  // aspetti finche' il lato comprato sta sopra questo
+  TETTO_VINCENTE: 0.70,   // ruota solo se il vincente e' <= questo
+  MAX_ATTESA_S: 120,      // rete di sicurezza: oltre questo, decidi comunque
+  SIGLIA_TICK: 0.47,      // soglia per il conteggio "size sotto"
+  POLL_MS: 1000,
+  OUT_DIR: "out",
+};
 
-const POLL_MS      = 1500;
-const SOGLIA       = 0.47;
-const DURATA_MIN   = 70;
-const FEE_CRYPTO   = 0.07;
+const COSTO_LATO    = CFG.QUOTA * CFG.SHARES;              // 2.20
+const COSTO_COPPIA  = COSTO_LATO * 2;                      // 4.40
+const INCASSO_COPPIA = CFG.SHARES * 1.0;                   // 5.00
+const PROFITTO_COPPIA = INCASSO_COPPIA - COSTO_COPPIA;     // +0.60
+const PERDITA_STOP = (CFG.STOP - CFG.QUOTA) * CFG.SHARES;  // -0.45
 
-// --- RETRY ESITO -------------------------------------------------------------
-const ESITO_RETRY_MS  = 12000;  // attesa prima del 2o tentativo
-const ESITO_RETRY_2MS = 45000;  // attesa prima del 3o tentativo
-const ESITO_DIFF_MIN  = 0.90;   // |pUp - pDn| minimo per dichiarare un esito
+const GAMMA = process.env.GAMMA_API || "https://gamma-api.polymarket.com";
+const CLOB  = process.env.CLOB_API  || "https://clob.polymarket.com";
+const WINDOW = 300;
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function trovaRound() {
-  const now = Math.floor(Date.now() / 1000);
-  const base = Math.floor(now / 300) * 300;
-
-  for (const off of [0, -300]) {
-    const slug = `btc-updown-5m-${base + off}`;
-    let r;
-    try { r = await fetch(`${GAMMA}/events?slug=${slug}`); } catch { continue; }
-    if (!r.ok) continue;
-    let j; try { j = await r.json(); } catch { continue; }
-    const evs = Array.isArray(j) ? j : j.data || [];
-    if (!evs.length) continue;
-
-    const m = (evs[0].markets || [])[0];
-    if (!m) continue;
-
-    let tok = [], outs = [];
-    try { tok = JSON.parse(m.clobTokenIds || "[]"); } catch {}
-    try { outs = JSON.parse(m.outcomes || "[]"); } catch {}
-    if (tok.length < 2) continue;
-
-    const fine  = new Date(m.endDate).getTime();
-    const manca = (fine - Date.now()) / 60000;
-    if (manca < 4.85 || manca > 5.60) continue;
-
-    const iUp = outs.findIndex(o => /up/i.test(o));
-    const iDn = outs.findIndex(o => /down/i.test(o));
-
-    console.log(`[gamma] ROUND ${m.slug} | chiude tra ${manca.toFixed(2)}'`);
-    return {
-      slug: m.slug, question: m.question, fine,
-      conditionId: m.conditionId,
-      upToken: tok[iUp >= 0 ? iUp : 0],
-      downToken: tok[iDn >= 0 ? iDn : 1],
-    };
-  }
-  return null;
+async function jget(url) {
+  const r = await fetch(url, { headers: { accept: "application/json" } });
+  if (!r.ok) throw new Error(`${r.status} ${url}`);
+  return r.json();
 }
 
-async function book(tokenId) {
+function roundStart(now = Date.now()) {
+  return Math.floor(now / 1000 / WINDOW) * WINDOW;
+}
+
+async function trovaRound(startTs) {
+  const slug = `btc-updown-5m-${startTs}`;
   try {
-    const r = await fetch(`${CLOB}/book?token_id=${tokenId}`);
-    if (!r.ok) return null;
-    const j = await r.json();
-    const bids = (j.bids || []).map(b => ({ p: parseFloat(b.price), s: parseFloat(b.size) }))
-      .filter(x => x.p > 0 && x.p < 1);
-    const asks = (j.asks || []).map(a => ({ p: parseFloat(a.price), s: parseFloat(a.size) }))
-      .filter(x => x.p > 0 && x.p < 1);
-    if (!bids.length || !asks.length) return null;
-    bids.sort((a, b) => b.p - a.p);
-    asks.sort((a, b) => a.p - b.p);
-
-    const sizeFino = lim => asks.filter(l => l.p <= lim).reduce((t, l) => t + l.s, 0);
-
+    const ev = await jget(`${GAMMA}/events?slug=${slug}`);
+    if (!Array.isArray(ev) || !ev.length) return null;
+    const m = ev[0].markets?.[0];
+    if (!m) return null;
+    let tokens = m.clobTokenIds;
+    if (typeof tokens === "string") tokens = JSON.parse(tokens);
     return {
-      bid: bids[0].p, ask: asks[0].p,
-      askSize: asks[0].s, bidSize: bids[0].s,
-      size42: sizeFino(0.42), size45: sizeFino(0.45),
-      size47: sizeFino(0.47), size50: sizeFino(0.50),
-      livelli: asks.length,
-      spread: +(asks[0].p - bids[0].p).toFixed(4),
+      slug, title: ev[0].title, conditionId: m.conditionId,
+      upToken: tokens?.[0] ?? null, dnToken: tokens?.[1] ?? null,
     };
-  } catch { return null; }
-}
-
-async function infoMercato(conditionId) {
-  if (!conditionId) return null;
-  try {
-    const r = await fetch(`${CLOB}/clob-markets/${conditionId}`);
-    if (!r.ok) return null;
-    const j = await r.json();
-    return {
-      minSize: j.mos ?? null, makerFee: j.mbf ?? null,
-      takerFee: j.tbf ?? null, rewards: j.r ?? null, tick: j.mts ?? null,
-    };
-  } catch { return null; }
-}
-
-// --- ESITO (una lettura) -----------------------------------------------------
-// Ritorna { vince, pUp, pDn } oppure null se i prezzi non sono ancora decisivi.
-function leggiEsito(m) {
-  if (!m) return null;
-  let prices = [], outs = [];
-  try { prices = JSON.parse(m.outcomePrices || "[]"); } catch {}
-  try { outs = JSON.parse(m.outcomes || "[]"); } catch {}
-  if (prices.length !== 2 || outs.length !== 2) return null;
-
-  const iUp = outs.findIndex(o => /up/i.test(o));
-  const iDn = outs.findIndex(o => /down/i.test(o));
-  const pUp = parseFloat(prices[iUp >= 0 ? iUp : 0]);
-  const pDn = parseFloat(prices[iDn >= 0 ? iDn : 1]);
-  if (!isFinite(pUp) || !isFinite(pDn)) return null;
-
-  if (pUp > 0.95 || pDn > 0.95 || Math.abs(pUp - pDn) > ESITO_DIFF_MIN) {
-    return { vince: pUp > pDn ? "UP" : "DOWN", pUp, pDn };
+  } catch (e) {
+    log("[warn] gamma:", e.message);
+    return null;
   }
-  return { vince: null, pUp, pDn };     // letto, ma non ancora decisivo
 }
 
-async function esitoDaGamma(conditionId, slug) {
-  try {
-    const r = await fetch(`${GAMMA}/events?slug=${slug}`);
-    if (!r.ok) return null;
-    const j = await r.json();
-    const evs = Array.isArray(j) ? j : j.data || [];
-    const m = ((evs[0] || {}).markets || [])[0];
-    return leggiEsito(m);
-  } catch { return null; }
-}
+class BookReader {
+  constructor(tokens) { this.tokens = tokens; this.books = new Map(); this.ws = null; }
 
-// Con retry: il mercato appena chiuso spesso non ha ancora i prezzi finali.
-// Non blocchiamo a lungo: se il round successivo è già partito, ci arrendiamo.
-async function esitoConRetry(conditionId, slug, scadenza) {
-  const attese = [0, ESITO_RETRY_MS, ESITO_RETRY_2MS];
-  let ultimo = null;
-  for (const attesa of attese) {
-    if (attesa > 0) {
-      // non sforare l'ingresso del round successivo
-      if (Date.now() + attesa > scadenza) break;
-      await sleep(attesa);
-    }
-    const e = await esitoDaGamma(conditionId, slug);
-    if (e) ultimo = e;
-    if (e && e.vince) return e;
-  }
-  return ultimo;   // può avere vince=null: prezzi letti ma non decisivi
-}
-
-async function registraRound(mkt) {
-  console.log(`\n=== ${mkt.slug} | ${mkt.question} ===`);
-
-  const serie = [];
-  let lettureOk = 0, vuote = 0, errori = 0;
-  let upTocco = null, dnTocco = null;
-  let minUp = 99, minDn = 99;
-  let apertura = null;
-  let mio35 = null, mio30 = null;
-  let maxSizeUp47 = 0, maxSizeDn47 = 0;
-
-  while (Date.now() < mkt.fine) {
-    const rem = Math.max(0, (mkt.fine - Date.now()) / 60000);
-    let bUp = null, bDn = null;
+  start() {
     try {
-      [bUp, bDn] = await Promise.all([book(mkt.upToken), book(mkt.downToken)]);
-    } catch { errori++; await sleep(POLL_MS); continue; }
+      this.ws = new WebSocket("wss://ws-subscriptions-clob.polymarket.com/ws/market");
+      this.ws.on("open", () => {
+        this.ws.send(JSON.stringify({ type: "subscribe", channel: "book", assets_ids: this.tokens }));
+        log("[ws] connesso, sottoscritto book");
+      });
+      this.ws.on("message", (raw) => {
+        try {
+          const msg = JSON.parse(raw.toString());
+          for (const m of (Array.isArray(msg) ? msg : [msg])) {
+            if (m.type === "book" || m.event_type === "book") {
+              const id = m.asset_id || m.market;
+              if (!id) continue;
+              this.books.set(id, {
+                bids: (m.bids || m.buys || []).map((b) => [parseFloat(b.price), parseFloat(b.size)]),
+                asks: (m.asks || m.sells || []).map((a) => [parseFloat(a.price), parseFloat(a.size)]),
+              });
+            }
+          }
+        } catch (_) {}
+      });
+      this.ws.on("close", () => log("[ws] chiuso, uso REST"));
+      this.ws.on("error", () => {});
+    } catch (e) { log("[ws] errore:", e.message); }
+  }
 
-    if (bUp === null || bDn === null) { vuote++; await sleep(POLL_MS); continue; }
+  stop() { try { this.ws?.close(); } catch (_) {} }
 
-    lettureOk++;
-    if (bUp.ask < minUp) minUp = bUp.ask;
-    if (bDn.ask < minDn) minDn = bDn.ask;
-    if (bUp.size47 > maxSizeUp47) maxSizeUp47 = bUp.size47;
-    if (bDn.size47 > maxSizeDn47) maxSizeDn47 = bDn.size47;
-
-    if (!apertura) {
-      apertura = { up: bUp.ask, dn: bDn.ask, rem, s47up: bUp.size47, s47dn: bDn.size47 };
-      const upM = bUp.ask > SOGLIA, dnM = bDn.ask > SOGLIA;
-      console.log(`  APERTURA rem ${rem.toFixed(2)}' | UP ${bUp.ask}=${upM ? "MAKER" : "TAKER"} (size47 ${bUp.size47}) | DN ${bDn.ask}=${dnM ? "MAKER" : "TAKER"} (size47 ${bDn.size47})`);
+  async leggi(tokenId) {
+    if (!tokenId) return null;
+    let b = this.books.get(tokenId);
+    if (!b || (!b.bids.length && !b.asks.length)) {
+      try {
+        const r = await jget(`${CLOB}/book?token_id=${tokenId}`);
+        b = {
+          bids: (r.bids || []).map((x) => [parseFloat(x.price), parseFloat(x.size)]),
+          asks: (r.asks || []).map((x) => [parseFloat(x.price), parseFloat(x.size)]),
+        };
+        this.books.set(tokenId, b);
+      } catch (_) { return null; }
     }
+    const bids = (b.bids || []).filter((x) => isFinite(x[0]) && isFinite(x[1]));
+    const asks = (b.asks || []).filter((x) => isFinite(x[0]) && isFinite(x[1]));
+    const bestBid = bids.length ? Math.max(...bids.map((x) => x[0])) : null;
+    const bestAsk = asks.length ? Math.min(...asks.map((x) => x[0])) : null;
+    const sizeSotto = asks.filter((x) => x[0] <= CFG.SIGLIA_TICK).reduce((s, x) => s + x[1], 0);
+    return { bestBid, bestAsk, sizeSotto };
+  }
+}
 
-    serie.push({
-      rem: +rem.toFixed(2),
-      up: bUp.ask, dn: bDn.ask, spread: bUp.spread,
-      s42: bUp.size42, s45: bUp.size45, s47: bUp.size47, s50: bUp.size50,
-      dn42: bDn.size42, dn45: bDn.size45, dn47: bDn.size47, dn50: bDn.size50,
+async function supaInvia(righe) {
+  const url = process.env.SUPABASE_URL, key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) return false;
+  try {
+    const r = await fetch(`${url}/rest/v1/xsignals`, {
+      method: "POST",
+      headers: { apikey: key, authorization: `Bearer ${key}`,
+                 "content-type": "application/json", prefer: "return=minimal" },
+      body: JSON.stringify(righe),
     });
-
-    if (!upTocco && bUp.ask <= SOGLIA) {
-      upTocco = { px: bUp.ask, rem, size: bUp.size47 };
-      console.log(`  UP tocca ${SOGLIA} a ${rem.toFixed(2)}' (ask ${bUp.ask}, size47 ${bUp.size47.toFixed(0)})`);
-    }
-    if (!dnTocco && bDn.ask <= SOGLIA) {
-      dnTocco = { px: bDn.ask, rem, size: bDn.size47 };
-      console.log(`  DOWN tocca ${SOGLIA} a ${rem.toFixed(2)}' (ask ${bDn.ask}, size47 ${bDn.size47.toFixed(0)})`);
-    }
-
-    if (!(upTocco && dnTocco)) {
-      const mio = upTocco ? bUp.ask : (dnTocco ? bDn.ask : null);
-      if (mio !== null) {
-        if (mio35 === null && mio <= 0.35) mio35 = rem;
-        if (mio30 === null && mio <= 0.30) mio30 = rem;
-      }
-    }
-
-    if (lettureOk % 40 === 1) {
-      console.log(`  rem ${rem.toFixed(1)}' | UP ${bUp.ask} s47=${bUp.size47.toFixed(0)} | DN ${bDn.ask} s47=${bDn.size47.toFixed(0)}`);
-    }
-    await sleep(POLL_MS);
-  }
-
-  // --- ESITO con retry (non sfora l'ingresso del round successivo)
-  const prossimoRound = mkt.fine + 300000;   // fine + 5 min
-  const scadenza = Math.min(prossimoRound - 45000, mkt.fine + 120000);
-  const lettura = await esitoConRetry(mkt.conditionId, mkt.slug, scadenza);
-  const vincitore = lettura && lettura.vince ? lettura.vince : "?";
-  const prezziEsito = lettura ? `${lettura.pUp}/${lettura.pDn}` : "-";
-
-  const fr = await infoMercato(mkt.conditionId);
-
-  let primo = null, salitoDiretto = null;
-  if (upTocco && dnTocco) primo = upTocco.rem > dnTocco.rem ? "UP" : "DOWN";
-  else if (upTocco) { primo = "UP"; salitoDiretto = "DOWN"; }
-  else if (dnTocco) { primo = "DOWN"; salitoDiretto = "UP"; }
-
-  const esito = upTocco && dnTocco ? "COPPIA"
-              : (upTocco || dnTocco ? "UN_LATO" : "NIENTE_LETTURE");
-  const costo = upTocco && dnTocco ? upTocco.px + dnTocco.px : null;
-  const mioLato = primo;
-  const ioVinto = (mioLato && vincitore !== "?") ? mioLato === vincitore : null;
-
-  let upMaker = null, dnMaker = null, fee = 0, pnlLordo = null, pnlNetto = null;
-  let sizeAlTocco = null;
-
-  if (apertura) {
-    upMaker = apertura.up > SOGLIA;
-    dnMaker = apertura.dn > SOGLIA;
-
-    if (costo !== null) {
-      pnlLordo = +(1 - costo).toFixed(4);
-      if (!upMaker) fee += upTocco.px * (1 - upTocco.px) * FEE_CRYPTO;
-      if (!dnMaker) fee += dnTocco.px * (1 - dnTocco.px) * FEE_CRYPTO;
-      fee = +fee.toFixed(5);
-      pnlNetto = +(pnlLordo - fee).toFixed(4);
-      sizeAlTocco = Math.min(maxSizeUp47, maxSizeDn47);
-    }
-  }
-
-  console.log(`\n>>> ROUND ${mkt.slug}`);
-  console.log(`    letture ok: ${lettureOk} | vuote: ${vuote} | errori: ${errori}`);
-  console.log(`    UP   tocca ${SOGLIA}: ${upTocco ? upTocco.px + " @" + upTocco.rem.toFixed(2) + "'" : "NO"} (min ${minUp === 99 ? "-" : minUp})`);
-  console.log(`    DOWN tocca ${SOGLIA}: ${dnTocco ? dnTocco.px + " @" + dnTocco.rem.toFixed(2) + "'" : "NO"} (min ${minDn === 99 ? "-" : minDn})`);
-  console.log(`    PRIMO: ${primo || "nessuno"}${salitoDiretto ? ` | ${salitoDiretto} è SALITO` : ""}`);
-  console.log(`    ESITO: ${esito}${costo ? ` | costo ${costo.toFixed(2)}` : ""}`);
-  console.log(`    VINCE: ${vincitore}${vincitore === "?" ? ` (prezzi ${prezziEsito}, non decisivi)` : ` (prezzi ${prezziEsito})`}`);
-  console.log(`    MAKER? UP ${upMaker ? "SI" : "NO"} | DN ${dnMaker ? "SI" : "NO"}`);
-  if (pnlLordo !== null) console.log(`    PnL: lordo ${pnlLordo} | fee ${fee} | NETTO ${pnlNetto}`);
-  console.log(`    SIZE MAX sotto 0.47: UP ${maxSizeUp47.toFixed(0)} | DN ${maxSizeDn47.toFixed(0)}`);
-  if (esito === "UN_LATO") {
-    console.log(`    STOP: sotto 0.35 a ${mio35 === null ? "MAI" : mio35.toFixed(2) + "'"} | sotto 0.30 a ${mio30 === null ? "MAI" : mio30.toFixed(2) + "'"}`);
-  }
-  if (mioLato && ioVinto !== null) console.log(`    IL MIO LATO (${mioLato}) → ${ioVinto ? "VINTO" : "PERSO"}`);
-  else if (mioLato) console.log(`    IL MIO LATO (${mioLato}) → ESITO IGNOTO (escluso dal conteggio)`);
-  if (fr) console.log(`    MARKET: minSize ${fr.minSize} | fee ${fr.makerFee}/${fr.takerFee} | pool ${fr.rewards ? JSON.stringify(fr.rewards) : "nessuna"}`);
-  console.log(`<<<\n`);
-
-  return {
-    slug: mkt.slug, esito, costo, pnlLordo, fee, pnlNetto,
-    upTocco, dnTocco, primo, salitoDiretto, vincitore, mioLato, ioVinto,
-    prezziEsito,
-    lettureOk, vuote, errori,
-    minUp: minUp === 99 ? null : minUp, minDn: minDn === 99 ? null : minDn,
-    mio35, mio30, apertura, upMaker, dnMaker,
-    maxSizeUp47, maxSizeDn47, sizeAlTocco, serie, feeMercato: fr,
-  };
+    if (!r.ok) log("[supa] errore", r.status, await r.text());
+    return r.ok;
+  } catch (e) { log("[supa] errore:", e.message); return false; }
 }
 
-(async () => {
-  const fine = Date.now() + DURATA_MIN * 60000;
-  const fatti = new Set();
-  const risultati = [];
+async function eseguiRound(r) {
+  log(`\n${"=".repeat(70)}`);
+  log(`ROUND ${r.slug} | ${r.title}`);
 
-  while (Date.now() < fine) {
-    const mkt = await trovaRound();
-    if (!mkt) { await sleep(1000); continue; }
-    if (fatti.has(mkt.slug)) { await sleep(1000); continue; }
+  const reader = new BookReader([r.upToken, r.dnToken].filter(Boolean));
+  reader.start();
 
-    try {
-      const r = await registraRound(mkt);
-      fatti.add(mkt.slug);
-      risultati.push(r);
+  const inizio = roundStart();
+  const tick = [];
+  let firstUp = null, firstDn = null, winUp = 0, winDn = 0;
+  let decisione = null, deciso = false;
 
-      await supabase.from("signals").insert([{
-        category: "btc-maker-test",
-        market_title: r.slug,
-        condition_id: mkt.conditionId || null,
-        signal_type: r.esito,
-        detail: JSON.stringify({
-          up: r.upTocco, dn: r.dnTocco, costo: r.costo,
-          pnlLordo: r.pnlLordo, fee: r.fee, pnlNetto: r.pnlNetto,
-          primo: r.primo, vince: r.vincitore, mioLato: r.mioLato, ioVinto: r.ioVinto,
-          prezziEsito: r.prezziEsito,
-          apertura: r.apertura, upMaker: r.upMaker, dnMaker: r.dnMaker,
-          maxSizeUp47: r.maxSizeUp47, maxSizeDn47: r.maxSizeDn47, sizeAlTocco: r.sizeAlTocco,
-          stop35: r.mio35, stop30: r.mio30,
-          lettureOk: r.lettureOk, vuote: r.vuote, errori: r.errori,
-          minUp: r.minUp, minDn: r.minDn, feeMercato: r.feeMercato,
-        }),
-        edge: r.pnlNetto ?? null,
-        live: r.esito === "COPPIA",
-      }]);
+  while (Math.floor(Date.now() / 1000) - inizio < WINDOW) {
+    const t = (Date.now() - inizio * 1000) / 1000;
+    const rem = WINDOW - t;
+    const [up, dn] = await Promise.all([reader.leggi(r.upToken), reader.leggi(r.dnToken)]);
+    if (!up || !dn) { await sleep(CFG.POLL_MS); continue; }
 
-      if (r.serie.length) {
-        await supabase.from("signals").insert([{
-          category: "btc-tick",
-          market_title: r.slug,
-          condition_id: mkt.conditionId || null,
-          signal_type: "tick",
-          detail: JSON.stringify(r.serie),
-          edge: null, live: null,
-        }]);
+    const u = up.bestAsk, d = dn.bestAsk;
+    tick.push({ t: +t.toFixed(1), up: u, dn: d, sUp: up.sizeSotto, sDn: dn.sizeSotto });
+
+    if (u !== null && u > winUp) winUp = u;
+    if (d !== null && d > winDn) winDn = d;
+    if (firstUp === null && u !== null && u <= CFG.QUOTA) firstUp = +t.toFixed(1);
+    if (firstDn === null && d !== null && d <= CFG.QUOTA) firstDn = +t.toFixed(1);
+
+    // ── COPPIA: entrambi dentro ──────────────────────────────────────────
+    if (firstUp !== null && firstDn !== null && !decisione) {
+      decisione = { tipo: "COPPIA", a_secondi: +t.toFixed(1) };
+      log(`[SEGNALE] COPPIA chiusa @${t.toFixed(1)}s -> +${PROFITTO_COPPIA.toFixed(2)} $`);
+    }
+
+    // ── DECISIONE: quando il lato comprato scende sotto SOGLIA_PERDENTE ──
+    if (!decisione && !deciso) {
+      const dentroUp = firstUp !== null, dentroDn = firstDn !== null;
+      if (dentroUp !== dentroDn) {
+        const comprato = dentroUp ? "UP" : "DN";
+        const mancato  = dentroUp ? "DN" : "UP";
+        const pComp = dentroUp ? u : d;      // prezzo del lato COMPRATO
+        const pManc = dentroUp ? d : u;      // prezzo del lato MANCATO (probabile vincente)
+        const scaduto = t >= CFG.MAX_ATTESA_S;
+
+        if ((pComp !== null && pComp < CFG.SOGLIA_PERDENTE) || scaduto) {
+          const ruota = (pComp < CFG.SOGLIA_PERDENTE) &&
+                        (pManc !== null && pManc <= CFG.TETTO_VINCENTE);
+          decisione = {
+            tipo: ruota ? "ROTAZIONE" : "STOP",
+            a_secondi: +t.toFixed(1),
+            comprato, mancato,
+            prezzo_perdente: pComp,
+            prezzo_vincente: pManc,
+            perche: ruota ? "perdente sotto soglia, vincente ancora a sconto"
+                          : "condizioni non favorevoli alla rotazione",
+          };
+          if (ruota) {
+            const rot = (INCASSO_COPPIA + pComp * CFG.SHARES) - (CFG.QUOTA * CFG.SHARES + pManc * CFG.SHARES);
+            decisione.pnl_rotazione = +rot.toFixed(3);
+            log(`[SEGNALE] ROTAZIONE @${t.toFixed(1)}s: vendi ${comprato}@${pComp}, compra ${mancato}@${pManc} -> ${rot >= 0 ? "+" : ""}${rot.toFixed(2)} $`);
+          } else {
+            decisione.pnl_stop = PERDITA_STOP;
+            log(`[SEGNALE] STOP @${t.toFixed(1)}s: ${comprato} a ${pComp}, vincente ${mancato}@${pManc} -> -${Math.abs(PERDITA_STOP).toFixed(2)} $`);
+          }
+          deciso = true;
+        }
       }
-    } catch (e) { console.error("errore round:", e.message); }
+    }
 
-    const attesa = mkt.fine - Date.now() + 300;
-    if (attesa > 0) await sleep(attesa);
+    if (Math.floor(t) % 30 === 0 && Math.abs(t - Math.round(t)) < 0.6) {
+      log(`  t=${t.toFixed(0)}s rem=${rem.toFixed(1)}' | UP ${u} (s47 ${Math.round(up.sizeSotto)}) | DN ${d} (s47 ${Math.round(dn.sizeSotto)})`);
+    }
+    await sleep(CFG.POLL_MS);
   }
 
-  // --- RIEPILOGO -------------------------------------------------------------
-  const coppie = risultati.filter(r => r.esito === "COPPIA");
-  const unLato = risultati.filter(r => r.esito === "UN_LATO");
-  const lordo = coppie.reduce((t, r) => t + (r.pnlLordo || 0), 0);
-  const feeT  = coppie.reduce((t, r) => t + (r.fee || 0), 0);
-  const netto = lordo - feeT;
-  const sizeMed = coppie.length
-    ? coppie.reduce((t, r) => t + (r.maxSizeUp47 || 0), 0) / coppie.length : 0;
+  reader.stop();
 
-  // Win rate sul lato scelto (solo round con esito verificabile)
-  const noti  = risultati.filter(r => r.mioLato && r.vincitore !== "?");
-  const vinti = noti.filter(r => r.ioVinto === true).length;
-  const perc  = noti.length ? (vinti / noti.length * 100).toFixed(0) : "0";
+  const upMin = Math.min(...tick.map((x) => x.up ?? 9));
+  const dnMin = Math.min(...tick.map((x) => x.dn ?? 9));
+  const coppia = upMin <= CFG.QUOTA && dnMin <= CFG.QUOTA;
+  const esito = coppia ? "COPPIA" : "UN_LATO";
 
-  // Quanti lato-UP e lato-DN sono stati scelti, e come sono andati
-  const perLato = (L) => {
-    const s = noti.filter(r => r.mioLato === L);
-    const v = s.filter(r => r.ioVinto === true).length;
-    return `${L}: ${v}/${s.length}`;
+  let pnl;
+  if (coppia) pnl = PROFITTO_COPPIA;
+  else if (decisione && decisione.tipo === "ROTAZIONE") pnl = decisione.pnl_rotazione;
+  else pnl = PERDITA_STOP;
+
+  log(`>>> ROUND ${r.slug}`);
+  log(`    letture ok: ${tick.length} | esito: ${esito} | decisione: ${decisione ? decisione.tipo : "nessuna"}`);
+  log(`    UP min: ${upMin} | DN min: ${dnMin}`);
+  log(`    SIZE MAX sotto 0,47: UP ${Math.round(winUp)} | DN ${Math.round(winDn)}`);
+  if (decisione && decisione.a_secondi) {
+    log(`    DECISIONE @${decisione.a_secondi}s | perdente ${decisione.prezzo_perdente} | vincente ${decisione.prezzo_vincente}`);
+  }
+  log(`    PnL stimato: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} $`);
+
+  const riga = {
+    slug: r.slug, round_start: inizio,
+    ora_et: new Date(inizio * 1000).toLocaleString("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit" }),
+    esito, decisione: decisione ? decisione.tipo : null,
+    decisione_secondi: decisione?.a_secondi ?? null,
+    quota: CFG.QUOTA, up_min: upMin, dn_min: dnMin,
+    first_up: firstUp, first_dn: firstDn,
+    size_max_up47: Math.round(winUp), size_max_dn47: Math.round(winDn),
+    prezzo_perdente: decisione?.prezzo_perdente ?? null,
+    prezzo_vincente: decisione?.prezzo_vincente ?? null,
+    pnl, letture: tick.length,
   };
 
-  console.log(`\n════ RIEPILOGO ════`);
-  console.log(`round: ${risultati.length} | COPPIA ${coppie.length} | UN_LATO ${unLato.length}`);
-  console.log(`PnL LORDO ${lordo.toFixed(3)} | FEE ${feeT.toFixed(3)} | NETTO ${netto.toFixed(3)} | per round ${(coppie.length ? netto / coppie.length : 0).toFixed(4)}`);
-  console.log(`LATO: ${vinti}/${noti.length} vinti (${perc}%) | ${perLato("UP")} | ${perLato("DOWN")} | esclusi (esito ignoto): ${risultati.length - noti.length}`);
-  console.log(`size media sotto 0.47 sul lato UP: ${sizeMed.toFixed(0)} share`);
-  console.log(`════════════════════\n`);
-})();
+  await supaInvia([riga]);
+
+  fs.mkdirSync(CFG.OUT_DIR, { recursive: true });
+  fs.appendFileSync(path.join(CFG.OUT_DIR, "rounds.csv"),
+    [r.slug, inizio, esito, decisione ? decisione.tipo : "", decisione?.a_secondi ?? "",
+     upMin, dnMin, firstUp ?? "", firstDn ?? "", Math.round(winUp), Math.round(winDn), pnl].join(",") + "\n");
+  fs.writeFileSync(path.join(CFG.OUT_DIR, `${r.slug}.csv`),
+    "t,up,dn,size_under_up,size_under_dn\n" +
+    tick.map((x) => [x.t, x.up ?? "", x.dn ?? "", Math.round(x.sUp), Math.round(x.sDn)].join(",")).join("\n"));
+
+  return riga;
+}
+
+async function main() {
+  log("═══════════════════════════════════════════════════════");
+  log("  xsignal — MISURA + SEGNALI (nessun ordine)");
+  log("═══════════════════════════════════════════════════════");
+  log(`  quota ${CFG.QUOTA} | coppia ${COSTO_COPPIA.toFixed(2)} $ -> +${PROFITTO_COPPIA.toFixed(2)} $`);
+  log(`  stop ${CFG.STOP} (-${Math.abs(PERDITA_STOP).toFixed(2)} $)`);
+  log(`  REGOLA: aspetti finche' il lato comprato >= ${CFG.SOGLIA_PERDENTE}`);
+  log(`          sotto ${CFG.SOGLIA_PERDENTE} e vincente <= ${CFG.TETTO_VINCENTE} -> ROTAZIONE`);
+  log(`          altrimenti -> STOP`);
+  log("═══════════════════════════════════════════════════════");
+
+  while (true) {
+    const start = roundStart();
+    const r = await trovaRound(start);
+    if (!r || !r.upToken || !r.dnToken) {
+      log(`[wait] round ${start} non trovato, riprovo...`);
+      await sleep(15000);
+      continue;
+    }
+    try { await eseguiRound(r); } catch (e) { log("[err]", e.message); }
+    const attesa = Math.max(1000, (start + WINDOW) * 1000 - Date.now() + 2000);
+    log(`[wait] prossimo round fra ${(attesa / 1000).toFixed(0)}s`);
+    await sleep(attesa);
+  }
+}
+
+process.on("SIGINT", () => { log("stop"); process.exit(0); });
+main().catch((e) => { console.error(e); process.exit(1); });
