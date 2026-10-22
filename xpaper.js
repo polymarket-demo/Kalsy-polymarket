@@ -8,12 +8,11 @@
 //            usa il PREZZO REALE dell'ask, sottrae la FEE REALE del mercato,
 //            e tiene un PORTAFOGLIO con saldo, posizioni e storico trade.
 //
-// La simulazione e' PESSIMISTA di proposito:
-//   - fill solo se c'e' size sufficiente all'ask <= quota
-//   - fill al prezzo reale dell'ask (non alla quota sperata)
-//   - fee letta dal mercato (feeRateBps), non stimata
-//   - la rotazione si esegue solo se il book del perdente offre liquidita'
-//   - gli ordini non spostano il book (limite noto della simulazione)
+// Fix WebSocket (rispetto alla prima versione):
+//   - KEEP-ALIVE: ping ogni 10 s (Polymarket chiude se non riceve traffico)
+//   - nessun socket doppio: il vecchio viene terminato prima di riaprire
+//   - timeout sull'apertura: se non apre entro 15 s, riprova
+//   - riconnessione con backoff, senza timer sovrapposti
 //
 // REGOLA (identica al bot che monteremo):
 //   quota 0.44 · 5 share per lato · stop 0.35
@@ -26,18 +25,23 @@ import path from "path";
 
 // ─── CONFIGURAZIONE ────────────────────────────────────────────────────────
 const CFG = {
-  QUOTA: 0.44,             // quota di ingresso
-  SHARES: 5,               // share per lato
-  STOP: 0.35,              // prezzo di stop
-  SOGLIA_PERDENTE: 0.35,   // sotto questo il lato comprato e' "morto"
-  TETTO_VINCENTE: 0.70,    // sopra questo ruotare non conviene
-  MIN_DECISION_S: 15,      // NON decidere prima di questo secondo
-  MAX_ATTESA_S: 120,       // rete di sicurezza
-  MIN_SIZE_FILL: 5,        // size minima nel book per considerare il fill
-  MIN_SIZE_USCITA: 5,      // size minima nel book per uscire dal perdente
-  CAPITALE_INIZIALE: 100,  // dollari fittizi
+  QUOTA: 0.44,
+  SHARES: 5,
+  STOP: 0.35,
+  SOGLIA_PERDENTE: 0.35,
+  TETTO_VINCENTE: 0.70,
+  MIN_DECISION_S: 15,
+  MAX_ATTESA_S: 120,
+  MIN_SIZE_FILL: 5,
+  MIN_SIZE_USCITA: 5,
+  CAPITALE_INIZIALE: 100,
   POLL_MS: 1000,
   OUT_DIR: "out-paper",
+  // WebSocket
+  WS_URL: "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+  WS_PING_MS: 10000,       // keep-alive
+  WS_OPEN_TIMEOUT_MS: 15000,
+  WS_RECONNECT_MS: 3000,
 };
 
 const GAMMA = process.env.GAMMA_API || "https://gamma-api.polymarket.com";
@@ -77,12 +81,11 @@ async function trovaRound(startTs) {
     if (!m) return null;
     let tokens = m.clobTokenIds;
     if (typeof tokens === "string") tokens = JSON.parse(tokens);
-    // fee reale del mercato (campo del mercato, non stimata)
     const feeBps = Number(m.feeRateBps ?? m.fee_rate_bps ?? 0) || 0;
     return {
       slug, title: ev[0].title,
       upToken: tokens?.[0] ?? null, dnToken: tokens?.[1] ?? null,
-      feeRate: feeBps / 10000,   // es. 1000 bps -> 0.10
+      feeRate: feeBps / 10000,
     };
   } catch (e) {
     log("[warn] gamma:", e.message);
@@ -90,46 +93,111 @@ async function trovaRound(startTs) {
   }
 }
 
-// ─── BOOK REALE ────────────────────────────────────────────────────────────
+// ─── BOOK REALE (WebSocket robusto) ────────────────────────────────────────
 class BookReader {
-  constructor(tokens) { this.tokens = tokens; this.books = new Map(); this.ws = null; }
-
-  start() {
-    try {
-      this.ws = new WebSocket("wss://ws-subscriptions-clob.polymarket.com/ws/market");
-      this.ws.on("open", () => {
-        this.ws.send(JSON.stringify({ type: "subscribe", channel: "book", assets_ids: this.tokens }));
-        log("[ws] connesso");
-      });
-      this.ws.on("message", (raw) => {
-        try {
-          const msg = JSON.parse(raw.toString());
-          for (const m of (Array.isArray(msg) ? msg : [msg])) {
-            if (m.type === "book" || m.event_type === "book") {
-              const id = m.asset_id || m.market;
-              if (!id) continue;
-              this.books.set(id, {
-                bids: (m.bids || m.buys || []).map((b) => [parseFloat(b.price), parseFloat(b.size)]),
-                asks: (m.asks || m.sells || []).map((a) => [parseFloat(a.price), parseFloat(a.size)]),
-              });
-            }
-          }
-        } catch (_) {}
-      });
-      this.ws.on("close", () => {
-        log("[ws] chiuso, riconnessione fra 2s");
-        setTimeout(() => this.start(), 2000);       // ← riconnessione
-      });
-      this.ws.on("error", () => {});
-    } catch (e) { log("[ws] errore:", e.message); }
+  constructor(tokens) {
+    this.tokens = tokens;
+    this.books = new Map();
+    this.ws = null;
+    this.pingTimer = null;
+    this.reconnectTimer = null;
+    this.openTimer = null;
+    this.chiuso = false;
+    this.wsCaduto = 0;        // contatore, utile nei log
   }
 
-  stop() { try { this.ws?.close(); } catch (_) {} }
+  start() {
+    if (this.chiuso) return;
 
-  // Ritorna {bestBid, bestAsk, askSize, askLevels, bidLevels}
+    // 1. chiudi SEMPRE il socket vecchio: niente socket doppi
+    if (this.ws) {
+      try { this.ws.removeAllListeners(); this.ws.terminate(); } catch (_) {}
+      this.ws = null;
+    }
+    clearInterval(this.pingTimer);
+    clearTimeout(this.reconnectTimer);
+    clearTimeout(this.openTimer);
+
+    try {
+      this.ws = new WebSocket(CFG.WS_URL);
+    } catch (e) {
+      log("[ws] errore creazione:", e.message);
+      this._riprova();
+      return;
+    }
+
+    // 2. timeout di apertura: se non apre, riprova
+    this.openTimer = setTimeout(() => {
+      if (this.ws && this.ws.readyState !== 1) {
+        log("[ws] timeout apertura, riprovo");
+        this._riprova();
+      }
+    }, CFG.WS_OPEN_TIMEOUT_MS);
+
+    this.ws.on("open", () => {
+      clearTimeout(this.openTimer);
+      try {
+        this.ws.send(JSON.stringify({
+          type: "subscribe", channel: "book", assets_ids: this.tokens,
+        }));
+      } catch (_) {}
+      log("[ws] connesso");
+      // 3. KEEP-ALIVE: senza ping Polymarket chiude
+      this.pingTimer = setInterval(() => {
+        try {
+          if (this.ws && this.ws.readyState === 1) this.ws.ping();
+        } catch (_) {}
+      }, CFG.WS_PING_MS);
+    });
+
+    this.ws.on("pong", () => { /* connessione viva */ });
+
+    this.ws.on("message", (raw) => {
+      try {
+        const msg = JSON.parse(raw.toString());
+        for (const m of (Array.isArray(msg) ? msg : [msg])) {
+          if (m.type === "book" || m.event_type === "book") {
+            const id = m.asset_id || m.market;
+            if (!id) continue;
+            this.books.set(id, {
+              bids: (m.bids || m.buys || []).map((b) => [parseFloat(b.price), parseFloat(b.size)]),
+              asks: (m.asks || m.sells || []).map((a) => [parseFloat(a.price), parseFloat(a.size)]),
+            });
+          }
+        }
+      } catch (_) {}
+    });
+
+    this.ws.on("close", () => {
+      clearInterval(this.pingTimer);
+      clearTimeout(this.openTimer);
+      this.wsCaduto++;
+      if (this.chiuso) return;
+      log(`[ws] chiuso (#${this.wsCaduto}), riconnessione fra ${CFG.WS_RECONNECT_MS / 1000}s`);
+      this._riprova();
+    });
+
+    this.ws.on("error", () => { /* gestito dal close */ });
+  }
+
+  _riprova() {
+    if (this.chiuso) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => this.start(), CFG.WS_RECONNECT_MS);
+  }
+
+  stop() {
+    this.chiuso = true;
+    clearInterval(this.pingTimer);
+    clearTimeout(this.reconnectTimer);
+    clearTimeout(this.openTimer);
+    try { this.ws?.removeAllListeners(); this.ws?.terminate(); } catch (_) {}
+  }
+
   async leggi(tokenId) {
     if (!tokenId) return null;
     let b = this.books.get(tokenId);
+    // fallback REST se il WS non ha ancora consegnato il book
     if (!b || (!b.bids.length && !b.asks.length)) {
       try {
         const r = await jget(`${CLOB}/book?token_id=${tokenId}`);
@@ -142,27 +210,24 @@ class BookReader {
     }
     const bids = (b.bids || []).filter((x) => isFinite(x[0]) && isFinite(x[1]) && x[1] > 0);
     const asks = (b.asks || []).filter((x) => isFinite(x[0]) && isFinite(x[1]) && x[1] > 0);
-    // l'ask migliore e' il prezzo piu' basso a cui puoi comprare
     const sortedAsks = [...asks].sort((a, c) => a[0] - c[0]);
     const sortedBids = [...bids].sort((a, c) => c[0] - a[0]);
     return {
       bestBid: sortedBids.length ? sortedBids[0][0] : null,
       bestAsk: sortedAsks.length ? sortedAsks[0][0] : null,
       askSize: sortedAsks.length ? sortedAsks[0][1] : 0,
-      asks: sortedAsks,   // [[prezzo, size], ...] ordinati dal piu' economico
+      asks: sortedAsks,
       bids: sortedBids,
     };
   }
 }
 
-// ─── SIMULAZIONE DEL FILL DI UN ORDINE LIMIT ───────────────────────────────
-// Compri a `quota`: ti riempi contro le ask con prezzo <= quota, in ordine di prezzo.
-// Ritorna {fillato, prezzo, size, sizeDisponibile} — il prezzo e' la media dei livelli usati.
+// ─── SIMULAZIONE DEL FILL ──────────────────────────────────────────────────
 function simulaFill(book, quota, shares) {
   if (!book || !book.asks.length) return { fillato: false, sizeDisponibile: 0 };
   let rimaste = shares, speso = 0, sizeDisponibile = 0;
   for (const [p, s] of book.asks) {
-    if (p > quota) continue;               // sopra la tua quota non compri
+    if (p > quota) continue;
     sizeDisponibile += s;
     if (rimaste <= 0) continue;
     const q = Math.min(rimaste, s);
@@ -174,7 +239,6 @@ function simulaFill(book, quota, shares) {
 }
 
 // ─── FEE ───────────────────────────────────────────────────────────────────
-// Su Polymarket la fee si applica ai guadagni: fee * (prezzo * (1 - prezzo)).
 function feeSuFill(prezzo, shares, feeRate) {
   if (!feeRate) return 0;
   return feeRate * prezzo * (1 - prezzo) * shares;
@@ -190,8 +254,8 @@ async function eseguiRound(r) {
 
   const inizio = roundStart();
   const tick = [];
-  let fillUp = null, fillDn = null;          // {prezzo, size, fee, t}
-  let decisione = null, deciso = false, chiusura = null;
+  let fillUp = null, fillDn = null;
+  let decisione = null, deciso = false;
 
   while (Math.floor(Date.now() / 1000) - inizio < WINDOW) {
     const t = (Date.now() - inizio * 1000) / 1000;
@@ -206,8 +270,7 @@ async function eseguiRound(r) {
       bidUp: up.bestBid, bidDn: dn.bestBid,
     });
 
-    // ── 1. FILL DEI DUE LATI (simulato sul book REALE) ───────────────────
-    // Se un lato e' gia' fillato, non lo rifilliamo.
+    // 1. FILL (verificato sul book reale)
     if (!fillUp) {
       const f = simulaFill(up, CFG.QUOTA, CFG.SHARES);
       if (f.fillato) {
@@ -225,16 +288,16 @@ async function eseguiRound(r) {
       }
     }
 
-    // ── 2. COPPIA CHIUSA ─────────────────────────────────────────────────
+    // 2. COPPIA
     if (fillUp && fillDn && !decisione) {
       const speso = fillUp.prezzo * CFG.SHARES + fillDn.prezzo * CFG.SHARES;
       const fee = fillUp.fee + fillDn.fee;
       const netto = CFG.SHARES * 1.0 - speso - fee;
-      decisione = { tipo: "COPPIA", a_secondi: +t.toFixed(1), speso: r2(speso), fee: r2(fee), pnl: r2(netto) };
+      decisione = { tipo: "COPPIA", a_secondi: +t.toFixed(1), pnl: r2(netto) };
       log(`[PAPER] COPPIA chiusa @${t.toFixed(1)}s | speso ${r2(speso)} · fee ${r2(fee)} → NETTO ${netto >= 0 ? "+" : ""}${r2(netto)}`);
     }
 
-    // ── 3. DECISIONE (dopo il tempo minimo di osservazione) ──────────────
+    // 3. DECISIONE (dopo il tempo minimo)
     if (!decisione && !deciso && t >= CFG.MIN_DECISION_S) {
       const dentroUp = fillUp !== null, dentroDn = fillDn !== null;
       if (dentroUp !== dentroDn) {
@@ -242,8 +305,8 @@ async function eseguiRound(r) {
         const mancato  = dentroUp ? "DN" : "UP";
         const bookComprato = dentroUp ? up : dn;
         const bookMancato  = dentroUp ? dn : up;
-        const pComp = bookComprato.bestBid;     // per USCIRE dal perdente vendi al bid
-        const pManc = bookMancato.bestAsk;      // per COMPRARE il vincente paghi l'ask
+        const pComp = bookComprato.bestBid;
+        const pManc = bookMancato.bestAsk;
         const sizeUscita = bookComprato.bids.length ? bookComprato.bids[0][1] : 0;
         const scaduto = t >= CFG.MAX_ATTESA_S;
 
@@ -254,20 +317,18 @@ async function eseguiRound(r) {
           if (ruota) {
             const fillV = simulaFill(bookMancato, pManc, CFG.SHARES);
             if (fillV.fillato) {
-              // vendi il perdente al bid, compri il vincente all'ask
               const fillP = dentroUp ? fillUp : fillDn;
-              const incasso = fillP.prezzo ? CFG.SHARES * pComp : 0;
+              const incasso = CFG.SHARES * pComp;
               const spesaV = CFG.SHARES * fillV.prezzo;
               const feeV = feeSuFill(fillV.prezzo, CFG.SHARES, r.feeRate);
               const feeP = feeSuFill(pComp, CFG.SHARES, r.feeRate);
-              // il vincente vale 1.00 a scadenza SOLO se ha vinto: lo sappiamo a fine round
               decisione = {
                 tipo: "ROT", a_secondi: +t.toFixed(1),
                 comprato, mancato,
                 prezzo_perdente: r2(pComp), prezzo_vincente: r2(fillV.prezzo),
-                size_uscita: Math.round(sizeUscita),
                 _incasso_perdente: incasso, _spesa_vincente: spesaV,
-                _fee: feeV + feeP, _pnl_pre: r2(incasso - spesaV - feeV - feeP),
+                _speso_comprato: fillP.prezzo * CFG.SHARES,
+                _fee: feeV + feeP,
               };
               log(`[PAPER] ROTAZIONE @${t.toFixed(1)}s: vendi ${comprato}@${r2(pComp)} (size ${Math.round(sizeUscita)}), compra ${mancato}@${r2(fillV.prezzo)}`);
             }
@@ -280,7 +341,6 @@ async function eseguiRound(r) {
               tipo: "STOP", a_secondi: +t.toFixed(1),
               comprato, prezzo_perdente: pComp !== null ? r2(pComp) : null,
               prezzo_vincente: pManc !== null ? r2(pManc) : null,
-              size_uscita: Math.round(sizeUscita),
               _pnl: r2(uscita - speso - fee),
             };
             log(`[PAPER] STOP @${t.toFixed(1)}s: ${comprato} a ${pComp !== null ? r2(pComp) : "n/d"} → uscita ${r2(uscita)}`);
@@ -298,41 +358,35 @@ async function eseguiRound(r) {
 
   reader.stop();
 
-  // ── 4. LIQUIDAZIONE A SCADENZA ─────────────────────────────────────────
+  // 4. LIQUIDAZIONE
   const ultimo = tick[tick.length - 1] || {};
   const upFinale = ultimo.up ?? null, dnFinale = ultimo.dn ?? null;
 
-  // Se il round non e' stato deciso, liquida a mercato (stop di fine round)
   if (!decisione && (fillUp || fillDn)) {
     const fillP = fillUp || fillDn;
     const latoP = fillUp ? "up" : "dn";
     const prezzoUscita = ultimo[latoP] ?? 0.01;
     const uscita = CFG.SHARES * prezzoUscita;
     const speso = fillP.prezzo * CFG.SHARES;
-    decisione = {
-      tipo: "FINE_ROUND", a_secondi: 300,
-      _pnl: r2(uscita - speso - fillP.fee),
-    };
+    decisione = { tipo: "FINE_ROUND", a_secondi: 300, _pnl: r2(uscita - speso - fillP.fee) };
   }
 
-  // PnL del round
   let pnlRound = null, tipo = "NON_OPERATO";
   if (decisione) {
     if (decisione.tipo === "COPPIA") { pnlRound = decisione.pnl; tipo = "COPPIA"; }
     else if (decisione.tipo === "ROT") {
-      // il vincente vale 1,00 a scadenza solo se ha chiuso sopra 0,5
-      const libroMancato = decisione.mancato === "UP" ? upFinale : dnFinale;
-      const vince = libroMancato !== null && libroMancato !== undefined;
-      // usiamo il prezzo finale del lato comprato come indicatore
-      const finaleComprato = decisione.comprato === "UP" ? upFinale : dnFinale;
-      // il lato comprato a fine round vale 1,00 se ha vinto (prezzo alto)
-      // determiniamo chi ha vinto guardando i prezzi finali
-      const pUp = upFinale, pDn = dnFinale;
+      // CHI HA VINTO: lo decidiamo dal prezzo finale (il lato a 1,00 e' il vincitore)
       let vincente = null;
-      if (pUp !== null && pDn !== null) vincente = pUp > pDn ? "UP" : "DN";
+      if (upFinale !== null && dnFinale !== null) {
+        vincente = upFinale > dnFinale ? "UP" : "DN";
+      }
       const haVinto = vincente === decisione.mancato;
       const valoreVincente = haVinto ? CFG.SHARES * 1.0 : 0;
-      pnlRound = r2((decisione._incasso_perdente ?? 0) + valoreVincente - (decisione._spesa_vincente ?? 0) - CFG.QUOTA * CFG.SHARES - (decisione._fee ?? 0));
+      pnlRound = r2((decisione._incasso_perdente ?? 0)
+                    + valoreVincente
+                    - (decisione._spesa_vincente ?? 0)
+                    - (decisione._speso_comprato ?? 0)
+                    - (decisione._fee ?? 0));
       tipo = `ROT-${haVinto ? "OK" : "KO"}`;
       decisione.vincente_reale = vincente;
       decisione.pnl = pnlRound;
@@ -351,11 +405,10 @@ async function eseguiRound(r) {
   }
 
   log(`>>> ${r.slug}`);
-  log(`    tipo: ${tipo} | decisione: ${decisione ? decisione.tipo + " @" + decisione.a_secondi + "s" : "nessuna"}`);
+  log(`    tipo: ${tipo} | decisione: ${decisione ? decisione.tipo + " @" + decisione.a_secondi + "s" : "nessuna"} | ws caduti: ${reader.wsCaduto}`);
   if (pnlRound !== null) log(`    PnL REALIZZATO: ${pnlRound >= 0 ? "+" : ""}${pnlRound} $ | SALDO: ${wallet.capitale} $`);
   else log(`    nessun fill utile → round non operato`);
 
-  // salva tick + riga
   fs.mkdirSync(CFG.OUT_DIR, { recursive: true });
   fs.appendFileSync(path.join(CFG.OUT_DIR, "paper.csv"),
     [r.slug, tipo, decisione?.a_secondi ?? "", fillUp ? r2(fillUp.prezzo) : "", fillDn ? r2(fillDn.prezzo) : "",
@@ -366,7 +419,7 @@ async function eseguiRound(r) {
                      x.bidUp ?? "", x.bidDn ?? ""].join(",")).join("\n"));
 }
 
-// ─── RIEPILOGO (a fine giornata / su SIGINT) ───────────────────────────────
+// ─── RIEPILOGO ─────────────────────────────────────────────────────────────
 function riepilogo() {
   const perTipo = {};
   for (const t of wallet.trade) {
@@ -392,6 +445,7 @@ async function main() {
   log(`  quota ${CFG.QUOTA} · ${CFG.SHARES} share per lato · stop ${CFG.STOP}`);
   log(`  decisione: min ${CFG.MIN_DECISION_S}s · perdente <${CFG.SOGLIA_PERDENTE} e vincente <=${CFG.TETTO_VINCENTE} → ROT`);
   log(`  capitale fittizio: ${CFG.CAPITALE_INIZIALE} $`);
+  log(`  ws: ping ogni ${CFG.WS_PING_MS / 1000}s · timeout apertura ${CFG.WS_OPEN_TIMEOUT_MS / 1000}s`);
   log("═══════════════════════════════════════════════════════");
 
   while (true) {
