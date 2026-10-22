@@ -1,20 +1,30 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// xpaper.js — PAPER TRADING · VERSIONE SENZA ROTAZIONE
+// xpaper.js — PAPER TRADING · ATTESA LUNGA (v3)
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// COSA E' CAMBIATO
-//   La rotazione e' stata RIMOSSA. I dati l'hanno bocciata:
-//   19 tentativi, 19 ROT-KO. Comprare il lato "vincente" a 0.66-0.69 ha
-//   valore atteso circa zero (0.66 * 5.00 = 3.30 speso 3.35) e in piu'
-//   paga il book illiquido di fine round.
+// COSA E' CAMBIATO RISPETTO ALLA v2
 //
-// COSA RESTA
-//   quota 0.44 su UP e DN · 5 share per lato · stop 0.35
-//   fill VERIFICATO sul book reale (size + prezzo dell'ask)
-//   fee REALE dal mercato
-//   se un lato non si riempie entro il tempo massimo -> STOP, nessun altro ordine
+//   v2 aveva MIN_DECISION_S = 15: dopo 15 secondi, se un lato non era
+//   dentro, stoppava. I dati hanno mostrato che era troppo presto:
 //
-// E' identico a xpaper, con la sola differenza che la decisione e' sempre STOP.
+//     8:15  STOP @16.3s  ->  il DN e' entrato a  99.3s
+//     8:20  STOP @34.2s  ->  il DN e' entrato a  78.2s
+//     8:25  STOP @37.2s  ->  il DN e' entrato a 121.3s
+//     8:50  STOP @15.2s  ->  l'UP e' entrato a  84.2s
+//     9:20  STOP @15.3s  ->  il DN e' entrato a 231.3s
+//
+//   Cinque coppie perse per fretta. Se avesse aspettato sarebbero state
+//   +0,99 $ l'una invece di -0,45 $ di stop.
+//
+//   v3 NON ha piu' una soglia temporale di decisione. Aspetta SEMPRE fino
+//   alla fine del round e chiude SOLO se il lato comprato e' davvero morto.
+//
+// REGOLA v3
+//   quota 0.44 su UP e DN · 5 share per lato
+//   nessuno stop per tempo: si aspetta che la coppia si chiuda
+//   stop SOLO se il bid del lato comprato scende sotto STOP_MORTO (0.20)
+//     -> sotto 0.20 il titolo e' compromesso, non c'e' piu' nulla da recuperare
+//   se il round finisce con un solo lato, si liquida al prezzo finale
 
 import WebSocket from "ws";
 import fs from "fs";
@@ -22,16 +32,12 @@ import path from "path";
 
 // ─── CONFIGURAZIONE ────────────────────────────────────────────────────────
 const CFG = {
-  QUOTA: 0.44,
-  SHARES: 5,
-  STOP: 0.35,
-  SOGLIA_PERDENTE: 0.35,
-  MIN_DECISION_S: 15,
-  MAX_ATTESA_S: 120,
-  MIN_SIZE_FILL: 5,
+  QUOTA: 0.44,          // quota di ingresso
+  SHARES: 5,            // share per lato
+  STOP_MORTO: 0.20,     // sotto questo prezzo il lato comprato e' morto -> stop
   CAPITALE_INIZIALE: 100,
   POLL_MS: 1000,
-  OUT_DIR: "out-paper-norot",
+  OUT_DIR: "out-paper",
   WS_URL: "wss://ws-subscriptions-clob.polymarket.com/ws/market",
   WS_PING_MS: 10000,
   WS_OPEN_TIMEOUT_MS: 15000,
@@ -87,7 +93,7 @@ async function trovaRound(startTs) {
   }
 }
 
-// ─── BOOK (WebSocket robusto, invariato) ───────────────────────────────────
+// ─── BOOK (WebSocket robusto) ──────────────────────────────────────────────
 class BookReader {
   constructor(tokens) {
     this.tokens = tokens;
@@ -202,11 +208,14 @@ class BookReader {
 }
 
 // ─── FILL SIMULATO ─────────────────────────────────────────────────────────
+// Compra solo contro ask <= quota. Ritorna il prezzo medio dei livelli usati.
+// RIFIUTA i fill a prezzi morti (sotto il 30% della quota): non sono fill reali.
+const PREZZO_MIN_FILL = 0.30;
 function simulaFill(book, quota, shares) {
   if (!book || !book.asks.length) return { fillato: false, sizeDisponibile: 0 };
   let rimaste = shares, speso = 0, sizeDisponibile = 0;
   for (const [p, s] of book.asks) {
-    if (p > quota) continue;
+    if (p > quota || p < PREZZO_MIN_FILL) continue;   // niente fill a prezzi morti
     sizeDisponibile += s;
     if (rimaste <= 0) continue;
     const q = Math.min(rimaste, s);
@@ -233,7 +242,7 @@ async function eseguiRound(r) {
   const inizio = roundStart();
   const tick = [];
   let fillUp = null, fillDn = null;
-  let decisione = null, deciso = false;
+  let decisione = null;
 
   while (Math.floor(Date.now() / 1000) - inizio < WINDOW) {
     const t = (Date.now() - inizio * 1000) / 1000;
@@ -248,7 +257,7 @@ async function eseguiRound(r) {
       bidUp: up.bestBid, bidDn: dn.bestBid,
     });
 
-    // FILL (verificato sul book reale)
+    // FILL: si tenta fino alla fine del round, senza finestre temporali
     if (!fillUp) {
       const f = simulaFill(up, CFG.QUOTA, CFG.SHARES);
       if (f.fillato) {
@@ -266,7 +275,7 @@ async function eseguiRound(r) {
       }
     }
 
-    // COPPIA
+    // COPPIA: appena entrambi sono dentro, il round e' chiuso in profitto
     if (fillUp && fillDn && !decisione) {
       const speso = fillUp.prezzo * CFG.SHARES + fillDn.prezzo * CFG.SHARES;
       const fee = fillUp.fee + fillDn.fee;
@@ -275,28 +284,24 @@ async function eseguiRound(r) {
       log(`[PAPER] COPPIA chiusa @${t.toFixed(1)}s | speso ${r2(speso)} · fee ${r2(fee)} → NETTO ${netto >= 0 ? "+" : ""}${r2(netto)}`);
     }
 
-    // STOP — nessuna rotazione
-    if (!decisione && !deciso && t >= CFG.MIN_DECISION_S) {
-      const dentroUp = fillUp !== null, dentroDn = fillDn !== null;
-      if (dentroUp !== dentroDn) {
+    // STOP: solo se il lato comprato e' DAVVERO morto (bid < STOP_MORTO).
+    // Nessuna soglia temporale: si aspetta che la coppia si chiuda.
+    if (!decisione && (fillUp || fillDn)) {
+      const dentroUp = fillUp !== null;
+      const bookComprato = dentroUp ? up : dn;
+      const pBid = bookComprato.bestBid;
+      if (pBid !== null && pBid < CFG.STOP_MORTO) {
         const comprato = dentroUp ? "UP" : "DN";
-        const bookComprato = dentroUp ? up : dn;
-        const pComp = bookComprato.bestBid;
-        const scaduto = t >= CFG.MAX_ATTESA_S;
-
-        if ((pComp !== null && pComp < CFG.SOGLIA_PERDENTE) || scaduto) {
-          const fillP = dentroUp ? fillUp : fillDn;
-          const uscita = CFG.SHARES * (pComp ?? 0);
-          const speso = fillP.prezzo * CFG.SHARES;
-          const fee = fillP.fee + feeSuFill(pComp ?? 0, CFG.SHARES, r.feeRate);
-          decisione = {
-            tipo: "STOP", a_secondi: +t.toFixed(1),
-            comprato, prezzo_perdente: pComp !== null ? r2(pComp) : null,
-            _pnl: r2(uscita - speso - fee),
-          };
-          log(`[PAPER] STOP @${t.toFixed(1)}s: ${comprato} a ${pComp !== null ? r2(pComp) : "n/d"} → uscita ${r2(uscita)}`);
-          deciso = true;
-        }
+        const fillP = dentroUp ? fillUp : fillDn;
+        const uscita = CFG.SHARES * pBid;
+        const speso = fillP.prezzo * CFG.SHARES;
+        const fee = fillP.fee + feeSuFill(pBid, CFG.SHARES, r.feeRate);
+        decisione = {
+          tipo: "STOP_MORTO", a_secondi: +t.toFixed(1),
+          comprato, prezzo_uscita: r2(pBid),
+          _pnl: r2(uscita - speso - fee),
+        };
+        log(`[PAPER] STOP_MORTO @${t.toFixed(1)}s: ${comprato} sceso a ${r2(pBid)} (< ${CFG.STOP_MORTO}) → uscita ${r2(uscita)}`);
       }
     }
 
@@ -308,7 +313,7 @@ async function eseguiRound(r) {
 
   reader.stop();
 
-  // LIQUIDAZIONE a fine round se non si e' deciso
+  // LIQUIDAZIONE a fine round se e' rimasto un solo lato
   const ultimo = tick[tick.length - 1] || {};
   if (!decisione && (fillUp || fillDn)) {
     const fillP = fillUp || fillDn;
@@ -322,7 +327,7 @@ async function eseguiRound(r) {
   let pnlRound = null, tipo = "NON_OPERATO";
   if (decisione) {
     if (decisione.tipo === "COPPIA") { pnlRound = decisione.pnl; tipo = "COPPIA"; }
-    else { pnlRound = decisione._pnl; tipo = decisione.tipo === "STOP" ? "STOP" : "FINE"; }
+    else { pnlRound = decisione._pnl; tipo = decisione.tipo; }
   }
 
   if (pnlRound !== null) {
@@ -356,7 +361,7 @@ function riepilogo() {
     perTipo[t.tipo] = perTipo[t.tipo] ?? { n: 0, pnl: 0 };
     perTipo[t.tipo].n++; perTipo[t.tipo].pnl += t.pnl;
   }
-  log("\n════ RIEPILOGO PAPER (senza rotazione) ════");
+  log("\n════ RIEPILOGO PAPER (attesa lunga) ════");
   log(`round operati: ${wallet.roundOperati} | saltati: ${wallet.roundSaltati}`);
   log(`capitale: ${CFG.CAPITALE_INIZIALE} → ${wallet.capitale} $`);
   log(`PnL realizzato: ${wallet.realizzato >= 0 ? "+" : ""}${r2(wallet.realizzato)} $`);
@@ -364,16 +369,17 @@ function riepilogo() {
   for (const [k, v] of Object.entries(perTipo)) {
     log(`  ${k}: ${v.n} round · ${v.pnl >= 0 ? "+" : ""}${r2(v.pnl)} $`);
   }
-  log("═══════════════════════════════════════════");
+  log("═════════════════════════════════════════");
 }
 
 // ─── MAIN ──────────────────────────────────────────────────────────────────
 async function main() {
   log("═══════════════════════════════════════════════════════");
-  log("  xpaper — PAPER TRADING · SENZA ROTAZIONE");
+  log("  xpaper — PAPER TRADING · ATTESA LUNGA");
   log("═══════════════════════════════════════════════════════");
-  log(`  quota ${CFG.QUOTA} · ${CFG.SHARES} share per lato · stop ${CFG.STOP}`);
-  log(`  decisione: min ${CFG.MIN_DECISION_S}s · lato non riempito → STOP`);
+  log(`  quota ${CFG.QUOTA} · ${CFG.SHARES} share per lato`);
+  log(`  nessuno stop per tempo: la coppia ha tutto il round`);
+  log(`  stop solo se il lato comprato scende sotto ${CFG.STOP_MORTO}`);
   log(`  capitale fittizio: ${CFG.CAPITALE_INIZIALE} $`);
   log("═══════════════════════════════════════════════════════");
 
