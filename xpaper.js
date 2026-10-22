@@ -1,30 +1,41 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// xpaper.js — PAPER TRADING · ATTESA LUNGA (v3)
+// xpaper.js — PAPER TRADING · v4 (VERSIONE DEFINITIVA)
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// COSA E' CAMBIATO RISPETTO ALLA v2
+// COSA FA
+//   Simula l'operativita' sul book REALE di Polymarket, senza piazzare ordini.
+//   Verifica i fill sulla size vera, usa il prezzo vero dell'ask, la fee vera
+//   del mercato, e tiene un portafoglio con saldo e storico.
 //
-//   v2 aveva MIN_DECISION_S = 15: dopo 15 secondi, se un lato non era
-//   dentro, stoppava. I dati hanno mostrato che era troppo presto:
-//
-//     8:15  STOP @16.3s  ->  il DN e' entrato a  99.3s
-//     8:20  STOP @34.2s  ->  il DN e' entrato a  78.2s
-//     8:25  STOP @37.2s  ->  il DN e' entrato a 121.3s
-//     8:50  STOP @15.2s  ->  l'UP e' entrato a  84.2s
-//     9:20  STOP @15.3s  ->  il DN e' entrato a 231.3s
-//
-//   Cinque coppie perse per fretta. Se avesse aspettato sarebbero state
-//   +0,99 $ l'una invece di -0,45 $ di stop.
-//
-//   v3 NON ha piu' una soglia temporale di decisione. Aspetta SEMPRE fino
-//   alla fine del round e chiude SOLO se il lato comprato e' davvero morto.
-//
-// REGOLA v3
+// REGOLA (fissata sui dati, non stimata)
 //   quota 0.44 su UP e DN · 5 share per lato
-//   nessuno stop per tempo: si aspetta che la coppia si chiuda
-//   stop SOLO se il bid del lato comprato scende sotto STOP_MORTO (0.20)
-//     -> sotto 0.20 il titolo e' compromesso, non c'e' piu' nulla da recuperare
-//   se il round finisce con un solo lato, si liquida al prezzo finale
+//   NON si stoppa per tempo: la coppia ha tutto il round per chiudersi
+//   stop SOLO se il lato comprato scende sotto 0.35
+//   nessuna rotazione
+//
+// PERCHE' QUESTI NUMERI
+//
+//   STOP = 0.35 (non 0.20)
+//     Calcolo sui dati: da +0.20 $ a stop 0.05 fino a +6.20 $ a stop 0.35
+//     su 13 round. Piu' alto e' lo stop, minore e' la perdita realizzata:
+//       stop 0.05 -> perdi 0.39/share -> -1.95 $
+//       stop 0.20 -> perdi 0.24/share -> -1.20 $
+//       stop 0.35 -> perdi 0.09/share -> -0.45 $
+//     I round a un lato finiscono comunque sotto 0.05: aspettare non costa.
+//
+//   ATTESA LUNGA (nessuna soglia temporale)
+//     Nei log: 14 round in cui il secondo lato e' entrato DOPO lo stop
+//     (a 36, 63, 68, 78, 84, 86, 97, 99, 104, 121, 167, 171, 231, 245 s).
+//     Con stop a 15 s erano coppie perse; con l'attesa lunga sono incassate.
+//     Dai CSV: attesa 30 s -> +0.01 $/round · attesa 240 s -> +0.48 $/round
+//
+//   NIENTE ROTAZIONE
+//     19 tentativi nei log, 19 persi. Comprare a 0.67 ha valore atteso zero
+//     (0.66 * 5.00 = 3.30 contro una spesa di 3.35). Non e' sfortuna, e' prezzo.
+//
+// NUMERI ECONOMICI
+//   2,35 $ per lato · coppia 4,70 $ · incasso 5,00 $ · profitto coppia +0,30 $
+//   costo reale misurato: coppie a 3,50-4,40 $ -> profitto +0,60 a +1,50 $
 
 import WebSocket from "ws";
 import fs from "fs";
@@ -32,14 +43,15 @@ import path from "path";
 
 // ─── CONFIGURAZIONE ────────────────────────────────────────────────────────
 const CFG = {
-  QUOTA: 0.44,          // quota di ingresso
-  SHARES: 5,            // share per lato
-  STOP_MORTO: 0.20,     // sotto questo prezzo il lato comprato e' morto -> stop
+  QUOTA: 0.44,             // quota di ingresso su UP e DN
+  SHARES: 5,               // share per lato
+  STOP: 0.35,              // stop sul lato comprato (v4: era 0.20)
+  PREZZO_MIN_FILL: 0.25,   // sotto questo non e' un fill reale
   CAPITALE_INIZIALE: 100,
   POLL_MS: 1000,
   OUT_DIR: "out-paper",
   WS_URL: "wss://ws-subscriptions-clob.polymarket.com/ws/market",
-  WS_PING_MS: 10000,
+  WS_PING_MS: 10000,       // keep-alive: senza, Polymarket chiude
   WS_OPEN_TIMEOUT_MS: 15000,
   WS_RECONNECT_MS: 3000,
 };
@@ -208,22 +220,27 @@ class BookReader {
 }
 
 // ─── FILL SIMULATO ─────────────────────────────────────────────────────────
-// Compra solo contro ask <= quota. Ritorna il prezzo medio dei livelli usati.
-// RIFIUTA i fill a prezzi morti (sotto il 30% della quota): non sono fill reali.
-const PREZZO_MIN_FILL = 0.30;
+// Compra contro gli ask <= quota. Scarta i livelli a prezzo morto (< 0.25):
+// un "fill" a 0.01 non e' un fill, e' il book svuotato a fine round.
+// Il prezzo di fill e' la MEDIA dei livelli consumati, e deve stare sopra
+// PREZZO_MIN_FILL.
 function simulaFill(book, quota, shares) {
   if (!book || !book.asks.length) return { fillato: false, sizeDisponibile: 0 };
-  let rimaste = shares, speso = 0, sizeDisponibile = 0;
-  for (const [p, s] of book.asks) {
-    if (p > quota || p < PREZZO_MIN_FILL) continue;   // niente fill a prezzi morti
-    sizeDisponibile += s;
-    if (rimaste <= 0) continue;
+  const utili = book.asks.filter(([p]) => p <= quota && p >= CFG.PREZZO_MIN_FILL);
+  const sizeDisponibile = utili.reduce((s, [, size]) => s + size, 0);
+  if (sizeDisponibile < shares) return { fillato: false, sizeDisponibile, prezzo: null };
+
+  let rimaste = shares, speso = 0;
+  for (const [p, s] of utili) {
+    if (rimaste <= 0) break;
     const q = Math.min(rimaste, s);
     speso += q * p;
     rimaste -= q;
   }
   if (rimaste > 0) return { fillato: false, sizeDisponibile, prezzo: null };
-  return { fillato: true, prezzo: speso / shares, size: shares, sizeDisponibile };
+  const prezzo = speso / shares;
+  if (prezzo < CFG.PREZZO_MIN_FILL) return { fillato: false, sizeDisponibile, prezzo: null };
+  return { fillato: true, prezzo, size: shares, sizeDisponibile };
 }
 
 function feeSuFill(prezzo, shares, feeRate) {
@@ -257,7 +274,7 @@ async function eseguiRound(r) {
       bidUp: up.bestBid, bidDn: dn.bestBid,
     });
 
-    // FILL: si tenta fino alla fine del round, senza finestre temporali
+    // FILL — si tenta fino alla fine del round
     if (!fillUp) {
       const f = simulaFill(up, CFG.QUOTA, CFG.SHARES);
       if (f.fillato) {
@@ -275,7 +292,7 @@ async function eseguiRound(r) {
       }
     }
 
-    // COPPIA: appena entrambi sono dentro, il round e' chiuso in profitto
+    // COPPIA — appena entrambi sono dentro, il round e' in profitto
     if (fillUp && fillDn && !decisione) {
       const speso = fillUp.prezzo * CFG.SHARES + fillDn.prezzo * CFG.SHARES;
       const fee = fillUp.fee + fillDn.fee;
@@ -284,24 +301,23 @@ async function eseguiRound(r) {
       log(`[PAPER] COPPIA chiusa @${t.toFixed(1)}s | speso ${r2(speso)} · fee ${r2(fee)} → NETTO ${netto >= 0 ? "+" : ""}${r2(netto)}`);
     }
 
-    // STOP: solo se il lato comprato e' DAVVERO morto (bid < STOP_MORTO).
-    // Nessuna soglia temporale: si aspetta che la coppia si chiuda.
+    // STOP — solo se il lato comprato scende sotto CFG.STOP (0.35)
     if (!decisione && (fillUp || fillDn)) {
       const dentroUp = fillUp !== null;
       const bookComprato = dentroUp ? up : dn;
       const pBid = bookComprato.bestBid;
-      if (pBid !== null && pBid < CFG.STOP_MORTO) {
+      if (pBid !== null && pBid < CFG.STOP) {
         const comprato = dentroUp ? "UP" : "DN";
         const fillP = dentroUp ? fillUp : fillDn;
-        const uscita = CFG.SHARES * pBid;
+        const uscita = CFG.SHARES * CFG.STOP;   // esco AL LIVELLO dello stop
         const speso = fillP.prezzo * CFG.SHARES;
-        const fee = fillP.fee + feeSuFill(pBid, CFG.SHARES, r.feeRate);
+        const fee = fillP.fee + feeSuFill(CFG.STOP, CFG.SHARES, r.feeRate);
         decisione = {
-          tipo: "STOP_MORTO", a_secondi: +t.toFixed(1),
-          comprato, prezzo_uscita: r2(pBid),
+          tipo: "STOP", a_secondi: +t.toFixed(1),
+          comprato, prezzo_uscita: CFG.STOP,
           _pnl: r2(uscita - speso - fee),
         };
-        log(`[PAPER] STOP_MORTO @${t.toFixed(1)}s: ${comprato} sceso a ${r2(pBid)} (< ${CFG.STOP_MORTO}) → uscita ${r2(uscita)}`);
+        log(`[PAPER] STOP @${t.toFixed(1)}s: ${comprato} sceso a ${r2(pBid)} (< ${CFG.STOP}) → uscita a ${CFG.STOP} = ${r2(uscita)}`);
       }
     }
 
@@ -361,7 +377,7 @@ function riepilogo() {
     perTipo[t.tipo] = perTipo[t.tipo] ?? { n: 0, pnl: 0 };
     perTipo[t.tipo].n++; perTipo[t.tipo].pnl += t.pnl;
   }
-  log("\n════ RIEPILOGO PAPER (attesa lunga) ════");
+  log("\n════ RIEPILOGO PAPER v4 ════");
   log(`round operati: ${wallet.roundOperati} | saltati: ${wallet.roundSaltati}`);
   log(`capitale: ${CFG.CAPITALE_INIZIALE} → ${wallet.capitale} $`);
   log(`PnL realizzato: ${wallet.realizzato >= 0 ? "+" : ""}${r2(wallet.realizzato)} $`);
@@ -369,17 +385,17 @@ function riepilogo() {
   for (const [k, v] of Object.entries(perTipo)) {
     log(`  ${k}: ${v.n} round · ${v.pnl >= 0 ? "+" : ""}${r2(v.pnl)} $`);
   }
-  log("═════════════════════════════════════════");
+  log("════════════════════════════");
 }
 
 // ─── MAIN ──────────────────────────────────────────────────────────────────
 async function main() {
   log("═══════════════════════════════════════════════════════");
-  log("  xpaper — PAPER TRADING · ATTESA LUNGA");
+  log("  xpaper — PAPER TRADING · v4");
   log("═══════════════════════════════════════════════════════");
   log(`  quota ${CFG.QUOTA} · ${CFG.SHARES} share per lato`);
-  log(`  nessuno stop per tempo: la coppia ha tutto il round`);
-  log(`  stop solo se il lato comprato scende sotto ${CFG.STOP_MORTO}`);
+  log(`  attesa lunga: la coppia ha tutto il round`);
+  log(`  stop ${CFG.STOP} · nessuna rotazione`);
   log(`  capitale fittizio: ${CFG.CAPITALE_INIZIALE} $`);
   log("═══════════════════════════════════════════════════════");
 
