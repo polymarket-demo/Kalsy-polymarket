@@ -1,30 +1,28 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// xpaper.js — PAPER TRADING · v4.1
+// xpaper.js — PAPER TRADING · v7 · MULTI-QUOTA + MULTI-SOGLIA AGGIUNTA
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// COSA AGGIUNGE LA v4.1 RISPETTO ALLA v4
+// COSA MISURA (tutto in parallelo sullo stesso round, book reale)
 //
-//   1. RIMETTE l'esito nel log: COPPIA / UN_LATO, piu' UP min e DN min.
-//      Senza quelle righe non si puo' confrontare con gli altri bot.
+//   A) MULTI-QUOTA — a che prezzo conviene comprare i due lati
+//      0.35 · 0.37 · 0.40 · 0.42 · 0.44 · 0.47
 //
-//   2. FILL AL PRIMO LIVELLO, non alla media.
-//      Prima: un ask a 0.10 con piu' livelli dava un "fill" a 0.25 -> falso.
-//      Adesso: il fill e' al prezzo del primo livello utile, quello che in
-//      live prenderesti davvero.
+//   B) MULTI-SOGLIA AGGIUNTA — a che prezzo conviene aggiungere size
+//      sul lato che sale
+//      0.50 · 0.55 · 0.60 · 0.65 · 0.70
 //
-//   3. STOP GESTITO CON IL PREZZO REALE (il bid corrente).
-//      Se entro a 0.25 e il prezzo scende a 0.09, lo stop a 0.35 non esiste:
-//      non puoi vendere a 0.35 quello che il mercato paga 0.09.
+//   C) MULTI-TRAILING — a che soglia conviene chiudere l'aggiunta
+//      0.70 · 0.75 · 0.80 · 0.85 · 0.90
+//      Regola trailing: l'aggiunta sale fino a >= soglia, poi se
+//      riscende a quella soglia -> VENDO. Se non ci arriva -> a scadenza.
 //
-//   4. MAKER / TAKER e FEE PAGATE, in ogni round.
-//      - TAKER: compri contro l'ask -> il prezzo e' quello del book
-//      - MAKER: il fill avviene al livello esatto della quota
-//      Viene mostrata la fee pagata con il totale cumulato.
+//   Ogni combinazione (quota · soglia agg · trailing) e' un portafoglio
+//   virtuale separato. Alla fine il riepilogo dice quale combinazione rende.
 //
-// REGOLA
-//   quota 0.44 su UP e DN · 5 share per lato
-//   attesa lunga: la coppia ha tutto il round per chiudersi
-//   stop 0.35 (sul prezzo corrente) · nessuna rotazione
+// USCITA sul lato perdente: 0.40, non prima di 60 s dall'ingresso.
+// Nessuna rotazione.
+//
+// ═══════════════════════════════════════════════════════════════════════════
 
 import WebSocket from "ws";
 import fs from "fs";
@@ -32,9 +30,13 @@ import path from "path";
 
 // ─── CONFIGURAZIONE ────────────────────────────────────────────────────────
 const CFG = {
-  QUOTA: 0.44,
+  QUOTE: [0.35, 0.37, 0.40, 0.42, 0.44, 0.47],
+  SOGLIE_AGG: [0.50, 0.55, 0.60, 0.65, 0.70],
+  TRAILINGS: [0.70, 0.75, 0.80, 0.85, 0.90],
   SHARES: 5,
-  STOP: 0.35,
+  SHARES_AGG: 5,
+  USCITA: 0.40,
+  USCITA_MIN_S: 60,
   PREZZO_MIN_FILL: 0.25,
   CAPITALE_INIZIALE: 100,
   POLL_MS: 1000,
@@ -52,6 +54,7 @@ const WINDOW = 300;
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const r2 = (x) => Math.round(x * 100) / 100;
+const r3 = (x) => Math.round(x * 1000) / 1000;
 const r4 = (x) => Math.round(x * 10000) / 10000;
 
 async function jget(url) {
@@ -64,15 +67,27 @@ function roundStart(now = Date.now()) {
   return Math.floor(now / 1000 / WINDOW) * WINDOW;
 }
 
-// ─── PORTAFOGLIO ───────────────────────────────────────────────────────────
-const wallet = {
-  capitale: CFG.CAPITALE_INIZIALE,
-  realizzato: 0,
-  feeP: 0,
-  trade: [],
-  roundOperati: 0,
-  roundSaltati: 0,
-};
+// ─── COMBINAZIONI: quota × soglia_agg × trailing ───────────────────────────
+// La soglia di aggiunta "none" = nessuna aggiunta (per avere il baseline).
+const COMBINAZIONI = [];
+for (const q of CFG.QUOTE) {
+  COMBINAZIONI.push({ id: `${q.toFixed(2)}|noagg`, quota: q, sogliaAgg: null, trailing: null });
+  for (const sa of CFG.SOGLIE_AGG) {
+    for (const tr of CFG.TRAILINGS) {
+      COMBINAZIONI.push({ id: `${q.toFixed(2)}|${sa.toFixed(2)}|${tr.toFixed(2)}`, quota: q, sogliaAgg: sa, trailing: tr });
+    }
+  }
+}
+
+function nuovoWallet(c) {
+  return {
+    id: c.id, quota: c.quota, sogliaAgg: c.sogliaAgg, trailing: c.trailing,
+    capitale: CFG.CAPITALE_INIZIALE, realizzato: 0, feeP: 0,
+    coppie: 0, unLato: 0, costoTotCoppie: 0, pnlCoppie: 0, pnlUnLato: 0,
+    aggOk: 0, aggKo: 0, aggTrail: 0, trade: [],
+  };
+}
+const wallets = new Map(COMBINAZIONI.map((c) => [c.id, nuovoWallet(c)]));
 
 // ─── ROUND + FEE ───────────────────────────────────────────────────────────
 async function trovaRound(startTs) {
@@ -99,14 +114,9 @@ async function trovaRound(startTs) {
 // ─── BOOK ──────────────────────────────────────────────────────────────────
 class BookReader {
   constructor(tokens) {
-    this.tokens = tokens;
-    this.books = new Map();
-    this.ws = null;
-    this.pingTimer = null;
-    this.reconnectTimer = null;
-    this.openTimer = null;
-    this.chiuso = false;
-    this.wsCaduto = 0;
+    this.tokens = tokens; this.books = new Map(); this.ws = null;
+    this.pingTimer = null; this.reconnectTimer = null; this.openTimer = null;
+    this.chiuso = false; this.wsCaduto = 0;
   }
 
   start() {
@@ -115,9 +125,7 @@ class BookReader {
       try { this.ws.removeAllListeners(); this.ws.terminate(); } catch (_) {}
       this.ws = null;
     }
-    clearInterval(this.pingTimer);
-    clearTimeout(this.reconnectTimer);
-    clearTimeout(this.openTimer);
+    clearInterval(this.pingTimer); clearTimeout(this.reconnectTimer); clearTimeout(this.openTimer);
 
     try { this.ws = new WebSocket(CFG.WS_URL); }
     catch (e) { log("[ws] errore creazione:", e.message); this._riprova(); return; }
@@ -153,8 +161,7 @@ class BookReader {
       } catch (_) {}
     });
     this.ws.on("close", () => {
-      clearInterval(this.pingTimer);
-      clearTimeout(this.openTimer);
+      clearInterval(this.pingTimer); clearTimeout(this.openTimer);
       this.wsCaduto++;
       if (this.chiuso) return;
       this._riprova();
@@ -170,9 +177,7 @@ class BookReader {
 
   stop() {
     this.chiuso = true;
-    clearInterval(this.pingTimer);
-    clearTimeout(this.reconnectTimer);
-    clearTimeout(this.openTimer);
+    clearInterval(this.pingTimer); clearTimeout(this.reconnectTimer); clearTimeout(this.openTimer);
     try { this.ws?.removeAllListeners(); this.ws?.terminate(); } catch (_) {}
   }
 
@@ -197,15 +202,12 @@ class BookReader {
       bestBid: sortedBids.length ? sortedBids[0][0] : null,
       bestAsk: sortedAsks.length ? sortedAsks[0][0] : null,
       askSize: sortedAsks.length ? sortedAsks[0][1] : 0,
-      asks: sortedAsks,
-      bids: sortedBids,
+      asks: sortedAsks, bids: sortedBids,
     };
   }
 }
 
-// ─── FILL ──────────────────────────────────────────────────────────────────
-// Il tuo ordine e' limit a QUOTA su entrambi i lati.
-// Fill al PRIMO livello utile (non alla media dei livelli).
+// ─── FILL / FEE ────────────────────────────────────────────────────────────
 function simulaFill(book, quota, shares) {
   if (!book || !book.asks.length) return { fillato: false, sizeDisponibile: 0 };
   const utili = book.asks.filter(([p]) => p <= quota && p >= CFG.PREZZO_MIN_FILL);
@@ -215,17 +217,13 @@ function simulaFill(book, quota, shares) {
   if (primoSize < shares) return { fillato: false, sizeDisponibile, prezzo: null };
   return { fillato: true, prezzo: primoPrezzo, size: shares, sizeDisponibile };
 }
-
-function ruoloFill(prezzoFill, quota) {
-  return Math.abs(prezzoFill - quota) < 0.005 ? "MAKER" : "TAKER";
-}
-
-function feeSuFill(prezzo, shares, feeRate) {
+function ruoloFill(p, quota) { return Math.abs(p - quota) < 0.005 ? "MAKER" : "TAKER"; }
+function feeSuFill(p, shares, feeRate) {
   if (!feeRate) return 0;
-  return feeRate * prezzo * (1 - prezzo) * shares;
+  return feeRate * p * (1 - p) * shares;
 }
 
-// ─── UN ROUND ──────────────────────────────────────────────────────────────
+// ─── UN ROUND — tutte le combinazioni in parallelo ─────────────────────────
 async function eseguiRound(r) {
   log(`\n${"=".repeat(70)}`);
   log(`ROUND ${r.slug} | ${r.title} | fee ${(r.feeRate * 10000).toFixed(0)} bps`);
@@ -235,9 +233,9 @@ async function eseguiRound(r) {
 
   const inizio = roundStart();
   const tick = [];
-  let fillUp = null, fillDn = null;
-  let decisione = null;
-  let feeRound = 0;
+  const stato = new Map(COMBINAZIONI.map((c) => [c.id, {
+    c, fillUp: null, fillDn: null, agg: null, decisione: null, feeRound: 0,
+  }]));
 
   while (Math.floor(Date.now() / 1000) - inizio < WINDOW) {
     const t = (Date.now() - inizio * 1000) / 1000;
@@ -248,59 +246,86 @@ async function eseguiRound(r) {
                 askUp: up.askSize, askDn: dn.askSize,
                 bidUp: up.bestBid, bidDn: dn.bestBid });
 
-    if (!fillUp) {
-      const f = simulaFill(up, CFG.QUOTA, CFG.SHARES);
-      if (f.fillato) {
-        const ruolo = ruoloFill(f.prezzo, CFG.QUOTA);
-        const fee = feeSuFill(f.prezzo, CFG.SHARES, r.feeRate);
-        fillUp = { prezzo: f.prezzo, size: CFG.SHARES, t: +t.toFixed(1), ruolo, fee };
-        feeRound += fee;
-        log(`  UP  FILL @${r2(f.prezzo)} (ask ${r2(up.bestAsk)}, size disp ${Math.round(f.sizeDisponibile)}) [${ruolo}] fee ${r4(fee)} a ${t.toFixed(1)}s`);
-      }
-    }
-    if (!fillDn) {
-      const f = simulaFill(dn, CFG.QUOTA, CFG.SHARES);
-      if (f.fillato) {
-        const ruolo = ruoloFill(f.prezzo, CFG.QUOTA);
-        const fee = feeSuFill(f.prezzo, CFG.SHARES, r.feeRate);
-        fillDn = { prezzo: f.prezzo, size: CFG.SHARES, t: +t.toFixed(1), ruolo, fee };
-        feeRound += fee;
-        log(`  DN  FILL @${r2(f.prezzo)} (ask ${r2(dn.bestAsk)}, size disp ${Math.round(f.sizeDisponibile)}) [${ruolo}] fee ${r4(fee)} a ${t.toFixed(1)}s`);
-      }
-    }
+    for (const s of stato.values()) {
+      const c = s.c;
 
-    if (fillUp && fillDn && !decisione) {
-      const speso = fillUp.prezzo * CFG.SHARES + fillDn.prezzo * CFG.SHARES;
-      const netto = CFG.SHARES * 1.0 - speso - feeRound;
-      const mU = fillUp.ruolo === "MAKER" ? "MAKER" : "TAKER";
-      const mD = fillDn.ruolo === "MAKER" ? "MAKER" : "TAKER";
-      decisione = { tipo: "COPPIA", a_secondi: +t.toFixed(1), speso: r2(speso), fee: r4(feeRound), pnl: r2(netto) };
-      log(`[PAPER] COPPIA chiusa @${t.toFixed(1)}s | ${mU}/${mD} | speso ${r2(speso)} · fee ${r4(feeRound)} → NETTO ${netto >= 0 ? "+" : ""}${r2(netto)}`);
-    }
+      // FILL dei due lati
+      if (!s.fillUp) {
+        const f = simulaFill(up, c.quota, CFG.SHARES);
+        if (f.fillato) {
+          s.fillUp = { prezzo: f.prezzo, t: +t.toFixed(1), ruolo: ruoloFill(f.prezzo, c.quota),
+                       fee: feeSuFill(f.prezzo, CFG.SHARES, r.feeRate) };
+          s.feeRound += s.fillUp.fee;
+        }
+      }
+      if (!s.fillDn) {
+        const f = simulaFill(dn, c.quota, CFG.SHARES);
+        if (f.fillato) {
+          s.fillDn = { prezzo: f.prezzo, t: +t.toFixed(1), ruolo: ruoloFill(f.prezzo, c.quota),
+                       fee: feeSuFill(f.prezzo, CFG.SHARES, r.feeRate) };
+          s.feeRound += s.fillDn.fee;
+        }
+      }
 
-    // STOP al bid reale
-    if (!decisione && (fillUp || fillDn)) {
-      const dentroUp = fillUp !== null;
-      const bookComprato = dentroUp ? up : dn;
-      const pBid = bookComprato.bestBid;
-      if (pBid !== null && pBid < CFG.STOP) {
-        const comprato = dentroUp ? "UP" : "DN";
-        const fillP = dentroUp ? fillUp : fillDn;
-        const uscita = CFG.SHARES * pBid;
-        const speso = fillP.prezzo * CFG.SHARES;
-        const feeV = feeSuFill(pBid, CFG.SHARES, r.feeRate);
-        feeRound += feeV;
-        decisione = {
-          tipo: "STOP", a_secondi: +t.toFixed(1), comprato,
-          prezzo_uscita: r2(pBid), fee: r4(feeRound),
-          _pnl: r2(uscita - speso - feeRound),
-        };
-        log(`[PAPER] STOP @${t.toFixed(1)}s: ${comprato} al bid ${r2(pBid)} (< ${CFG.STOP}) → incasso ${r2(uscita)} · fee ${r4(feeRound)}`);
+      // AGGIUNTA — solo se questa combinazione ha una soglia
+      if (!s.decisione && !s.agg && c.sogliaAgg !== null) {
+        for (const nome of ["up", "dn"]) {
+          const possiedo = nome === "up" ? s.fillUp !== null : s.fillDn !== null;
+          if (!possiedo) continue;
+          const book = nome === "up" ? up : dn;
+          const prezzo = book.bestAsk;
+          if (prezzo !== null && prezzo >= c.sogliaAgg && prezzo < 0.97) {
+            const f = simulaFill(book, prezzo, CFG.SHARES_AGG);
+            if (f.fillato) {
+              s.agg = { lato: nome, prezzo: f.prezzo, size: CFG.SHARES_AGG, t: +t.toFixed(1),
+                        fee: feeSuFill(f.prezzo, CFG.SHARES_AGG, r.feeRate),
+                        haToccato: false, chiuso: false, prezzoChiusura: null };
+              s.feeRound += s.agg.fee;
+            }
+          }
+        }
+      }
+
+      // TRAILING sull'aggiunta
+      if (s.agg && !s.agg.chiuso) {
+        const bookAgg = s.agg.lato === "up" ? up : dn;
+        const pBid = bookAgg.bestBid;
+        if (pBid !== null) {
+          if (!s.agg.haToccato && pBid >= c.trailing) s.agg.haToccato = true;
+          else if (s.agg.haToccato && pBid <= c.trailing) {
+            s.agg.chiuso = true; s.agg.prezzoChiusura = pBid;
+            s.feeRound += feeSuFill(pBid, s.agg.size, r.feeRate);
+          }
+        }
+      }
+
+      // COPPIA
+      if (s.fillUp && s.fillDn && !s.decisione) {
+        const speso = s.fillUp.prezzo * CFG.SHARES + s.fillDn.prezzo * CFG.SHARES;
+        const netto = CFG.SHARES * 1.0 - speso - s.feeRound;
+        s.decisione = { tipo: "COPPIA", a: +t.toFixed(1), costo: r2(speso), pnl: r2(netto) };
+      }
+
+      // USCITA sul lato perdente
+      if (!s.decisione && !s.agg && (s.fillUp || s.fillDn)) {
+        const dentroUp = s.fillUp !== null;
+        const fillP = dentroUp ? s.fillUp : s.fillDn;
+        if (t - fillP.t >= CFG.USCITA_MIN_S) {
+          const bookC = dentroUp ? up : dn;
+          const pBid = bookC.bestBid;
+          if (pBid !== null && pBid <= CFG.USCITA) {
+            const uscita = CFG.SHARES * pBid;
+            const speso = fillP.prezzo * CFG.SHARES;
+            s.feeRound += feeSuFill(pBid, CFG.SHARES, r.feeRate);
+            s.decisione = { tipo: "USCITA", a: +t.toFixed(1), prezzo_uscita: r2(pBid),
+                            pnl: r2(uscita - speso - s.feeRound) };
+          }
+        }
       }
     }
 
     if (Math.floor(t) % 60 === 0 && Math.abs(t - Math.round(t)) < 0.6) {
-      log(`  t=${t.toFixed(0)}s | UP ask ${up.bestAsk} (${Math.round(up.askSize)}) | DN ask ${dn.bestAsk} (${Math.round(dn.askSize)})`);
+      log(`  t=${t.toFixed(0)}s | UP ask ${up.bestAsk} | DN ask ${dn.bestAsk}`);
     }
     await sleep(CFG.POLL_MS);
   }
@@ -309,87 +334,131 @@ async function eseguiRound(r) {
 
   const upMin = Math.min(...tick.map((x) => x.up ?? 9));
   const dnMin = Math.min(...tick.map((x) => x.dn ?? 9));
-  const coppiaReale = upMin <= CFG.QUOTA && dnMin <= CFG.QUOTA;
-  const esito = coppiaReale ? "COPPIA" : "UN_LATO";
+  const esito = (upMin <= 0.44 && dnMin <= 0.44) ? "COPPIA" : "UN_LATO";
+  const ultimo = tick[tick.length - 1] || {};
 
-  if (!decisione && (fillUp || fillDn)) {
-    const fillP = fillUp || fillDn;
-    const latoP = fillUp ? "up" : "dn";
-    const ultimo = tick[tick.length - 1] || {};
-    const pUscita = ultimo[latoP] ?? 0.01;
-    const uscita = CFG.SHARES * pUscita;
-    const speso = fillP.prezzo * CFG.SHARES;
-    feeRound += feeSuFill(pUscita, CFG.SHARES, r.feeRate);
-    decisione = { tipo: "FINE_ROUND", a_secondi: 300, prezzo_uscita: r2(pUscita),
-                  fee: r4(feeRound), _pnl: r2(uscita - speso - feeRound) };
-  }
+  // ── chiusura e contabilita' ──
+  for (const s of stato.values()) {
+    const w = wallets.get(s.c.id);
 
-  let pnlRound = null, tipo = "NON_OPERATO";
-  if (decisione) {
-    if (decisione.tipo === "COPPIA") { pnlRound = decisione.pnl; tipo = "COPPIA"; }
-    else { pnlRound = decisione._pnl; tipo = decisione.tipo; }
-  }
+    if (!s.decisione && (s.fillUp || s.fillDn)) {
+      const fillP = s.fillUp || s.fillDn;
+      const latoP = s.fillUp ? "up" : "dn";
+      const pU = ultimo[latoP] ?? 0.01;
+      s.feeRound += feeSuFill(pU, CFG.SHARES, r.feeRate);
+      s.decisione = { tipo: "FINE_ROUND", a: 300, prezzo_uscita: r2(pU),
+                      pnl: r2(CFG.SHARES * pU - fillP.prezzo * CFG.SHARES - s.feeRound) };
+    }
+    if (!s.decisione) continue;
 
-  if (pnlRound !== null) {
-    wallet.realizzato += pnlRound;
-    wallet.feeP += feeRound;
-    wallet.capitale = r2(CFG.CAPITALE_INIZIALE + wallet.realizzato);
-    wallet.roundOperati++;
-    wallet.trade.push({ slug: r.slug, tipo, pnl: pnlRound, fee: r4(feeRound), esito });
-  } else {
-    wallet.roundSaltati++;
+    let pnl = s.decisione.pnl;
+    if (s.agg) {
+      const finUp = ultimo.up ?? 0, finDn = ultimo.dn ?? 0;
+      if (s.agg.chiuso) {
+        const pnlAgg = s.agg.size * s.agg.prezzoChiusura - s.agg.size * s.agg.prezzo;
+        pnl = r2(pnl + pnlAgg);
+        w.aggTrail++;
+      } else {
+        const vince = s.agg.lato === "up" ? finUp > finDn : finDn > finUp;
+        const pnlAgg = (vince ? s.agg.size * 1.0 : 0) - s.agg.size * s.agg.prezzo - s.agg.fee;
+        pnl = r2(pnl + pnlAgg);
+        if (vince) w.aggOk++; else w.aggKo++;
+      }
+    }
+
+    w.realizzato += pnl;
+    w.feeP += s.feeRound;
+    w.capitale = r2(CFG.CAPITALE_INIZIALE + w.realizzato);
+    w.trade.push({ slug: r.slug, tipo: s.decisione.tipo, pnl });
+    if (s.decisione.tipo === "COPPIA") {
+      w.coppie++; w.costoTotCoppie += s.decisione.costo; w.pnlCoppie += pnl;
+    } else { w.unLato++; w.pnlUnLato += pnl; }
   }
 
   log(`>>> ${r.slug}`);
-  log(`    esito: ${esito} | UP min: ${upMin} | DN min: ${dnMin}`);
-  log(`    tipo: ${tipo} | decisione: ${decisione ? decisione.tipo + " @" + decisione.a_secondi + "s" : "nessuna"} | ws caduti: ${reader.wsCaduto}`);
-  log(`    fee pagate: ${r4(feeRound)} $ (totale ${r4(wallet.feeP)} $)`);
-  if (pnlRound !== null) log(`    PnL REALIZZATO: ${pnlRound >= 0 ? "+" : ""}${pnlRound} $ | SALDO: ${wallet.capitale} $`);
-  else log(`    nessun fill utile → round non operato`);
-
-  fs.mkdirSync(CFG.OUT_DIR, { recursive: true });
-  fs.appendFileSync(path.join(CFG.OUT_DIR, "paper.csv"),
-    [r.slug, esito, tipo, decisione?.a_secondi ?? "",
-     fillUp ? `${r2(fillUp.prezzo)}:${fillUp.ruolo}` : "",
-     fillDn ? `${r2(fillDn.prezzo)}:${fillDn.ruolo}` : "",
-     r4(feeRound), pnlRound ?? "", wallet.capitale].join(",") + "\n");
-  fs.writeFileSync(path.join(CFG.OUT_DIR, `${r.slug}.csv`),
-    "t,up_ask,up_size,dn_ask,dn_size,up_bid,dn_bid\n" +
-    tick.map((x) => [x.t, x.up ?? "", Math.round(x.up ? x.askUp : 0), x.dn ?? "", Math.round(x.dn ? x.askDn : 0),
-                     x.bidUp ?? "", x.bidDn ?? ""].join(",")).join("\n"));
+  log(`    esito: ${esito} | UP min: ${upMin} | DN min: ${dnMin} | ws caduti: ${reader.wsCaduto}`);
+  // mostra solo le quote base (senza aggiunta) e la migliore combinazione corrente
+  const base = CFG.QUOTE.map((q) => wallets.get(`${q.toFixed(2)}|noagg`));
+  log(`    baseline per quota (senza aggiunta):`);
+  for (const w of base) {
+    log(`      ${w.quota.toFixed(2)} → coppie ${w.coppie} | PNL ${w.realizzato >= 0 ? "+" : ""}${r2(w.realizzato)} $ | saldo ${w.capitale}`);
+  }
 }
 
 // ─── RIEPILOGO ─────────────────────────────────────────────────────────────
 function riepilogo() {
-  const perTipo = {};
-  for (const t of wallet.trade) {
-    perTipo[t.tipo] = perTipo[t.tipo] ?? { n: 0, pnl: 0 };
-    perTipo[t.tipo].n++; perTipo[t.tipo].pnl += t.pnl;
+  const righe = [...wallets.values()].map((w) => {
+    const n = w.coppie + w.unLato;
+    return {
+      id: w.id, quota: w.quota, sogliaAgg: w.sogliaAgg, trailing: w.trailing,
+      round: n, coppie: w.coppie,
+      tasso: n ? +(100 * w.coppie / n).toFixed(1) : 0,
+      costoC: w.coppie ? +(w.costoTotCoppie / w.coppie).toFixed(3) : null,
+      profC: w.coppie ? +(w.pnlCoppie / w.coppie).toFixed(3) : null,
+      aggOk: w.aggOk, aggKo: w.aggKo, aggTrail: w.aggTrail,
+      PNL: r2(w.realizzato),
+      perRound: n ? r3(w.realizzato / n) : 0,
+      saldo: w.capitale,
+    };
+  }).sort((a, b) => b.PNL - a.PNL);
+
+  log("\n════ RIEPILOGO — TOP 15 COMBINAZIONI ════");
+  log(`quota | agg   | trail | coppie | tasso  | agg OK/KO/TR | PNL    | per round | saldo`);
+  for (const x of righe.slice(0, 15)) {
+    log(
+      ` ${x.quota.toFixed(2)} | ${(x.sogliaAgg ?? "no").toString().padEnd(5)} | ${(x.trailing ?? " -").toString().padEnd(5)} | ` +
+      `${String(x.coppie).padStart(6)} | ${String(x.tasso).padStart(5)}% | ` +
+      `${String(x.aggOk)}/${String(x.aggKo)}/${String(x.aggTrail)}`.padEnd(12) + ` | ` +
+      `${(x.PNL >= 0 ? "+" : "") + x.PNL.toFixed(2)} | ${String(x.perRound).padStart(9)} | ${x.saldo}`
+    );
   }
-  const coppie = wallet.trade.filter((x) => x.esito === "COPPIA").length;
-  log("\n════ RIEPILOGO PAPER v4.1 ════");
-  log(`round operati: ${wallet.roundOperati} | saltati: ${wallet.roundSaltati}`);
-  log(`esiti reali: COPPIA ${coppie} | UN_LATO ${wallet.roundOperati - coppie}`);
-  log(`capitale: ${CFG.CAPITALE_INIZIALE} → ${wallet.capitale} $`);
-  log(`fee pagate: ${r4(wallet.feeP)} $`);
-  log(`PnL realizzato: ${wallet.realizzato >= 0 ? "+" : ""}${r2(wallet.realizzato)} $`);
-  if (wallet.roundOperati) log(`per round: ${r2(wallet.realizzato / wallet.roundOperati)} $`);
-  for (const [k, v] of Object.entries(perTipo)) {
-    log(`  ${k}: ${v.n} round · ${v.pnl >= 0 ? "+" : ""}${r2(v.pnl)} $`);
+
+  // miglior soglia di aggiunta (media su tutte le quote e trailing)
+  const perSoglia = {};
+  for (const x of righe) {
+    if (x.sogliaAgg === null) continue;
+    const k = x.sogliaAgg;
+    perSoglia[k] = perSoglia[k] ?? { n: 0, pnl: 0, ok: 0, ko: 0, tr: 0 };
+    perSoglia[k].n++; perSoglia[k].pnl += x.PNL;
+    perSoglia[k].ok += x.aggOk; perSoglia[k].ko += x.aggKo; perSoglia[k].tr += x.aggTrail;
   }
-  log("════════════════════════════");
+  log("\n── per SOGLIA DI AGGIUNTA (media su tutte le quote/trailing) ──");
+  const soglie = Object.entries(perSoglia).map(([s, v]) => ({
+    soglia: +s, pnlMedio: +(v.pnl / v.n).toFixed(3), ok: v.ok, ko: v.ko, tr: v.tr,
+    winRate: (v.ok + v.ko + v.tr) ? +(100 * (v.ok + v.tr) / (v.ok + v.ko + v.tr)).toFixed(1) : 0,
+  })).sort((a, b) => b.pnlMedio - a.pnlMedio);
+  for (const x of soglie) {
+    log(`  agg >= ${x.soglia.toFixed(2)} → PNL medio ${x.pnlMedio >= 0 ? "+" : ""}${x.pnlMedio} $ | OK ${x.ok} · KO ${x.ko} · TRAIL ${x.tr} | win ${x.winRate}%`);
+  }
+
+  // miglior trailing (media)
+  const perTrail = {};
+  for (const x of righe) {
+    if (x.trailing === null) continue;
+    const k = x.trailing;
+    perTrail[k] = perTrail[k] ?? { n: 0, pnl: 0 };
+    perTrail[k].n++; perTrail[k].pnl += x.PNL;
+  }
+  log("\n── per TRAILING (media su tutte le quote/soglie) ──");
+  Object.entries(perTrail).map(([s, v]) => ({ t: +s, pnlMedio: +(v.pnl / v.n).toFixed(3) }))
+    .sort((a, b) => b.pnlMedio - a.pnlMedio)
+    .forEach((x) => log(`  trailing ${x.t.toFixed(2)} → PNL medio ${x.pnlMedio >= 0 ? "+" : ""}${x.pnlMedio} $`));
+
+  log(`\nMIGLIORE: ${righe[0].id} con PNL ${righe[0].PNL >= 0 ? "+" : ""}${righe[0].PNL} $ su ${righe[0].round} round`);
+  log("══════════════════════════════════════════");
 }
 
 // ─── MAIN ──────────────────────────────────────────────────────────────────
 async function main() {
   log("═══════════════════════════════════════════════════════");
-  log("  xpaper — PAPER TRADING · v4.1");
+  log("  xpaper — PAPER v7 · MULTI-QUOTA + MULTI-SOGLIA");
   log("═══════════════════════════════════════════════════════");
-  log(`  quota ${CFG.QUOTA} · ${CFG.SHARES} share per lato · stop ${CFG.STOP}`);
-  log(`  attesa lunga · nessuna rotazione`);
-  log(`  log: esito, UP/DN min, maker/taker, fee pagate`);
-  log(`  capitale fittizio: ${CFG.CAPITALE_INIZIALE} $`);
-  log("═══════════════════════════════════════════════════════");
+  log(`  quote: ${CFG.QUOTE.map((q) => q.toFixed(2)).join(" · ")}`);
+  log(`  soglie aggiunta: ${CFG.SOGLIE_AGG.map((s) => s.toFixed(2)).join(" · ")}`);
+  log(`  trailing: ${CFG.TRAILINGS.map((s) => s.toFixed(2)).join(" · ")}`);
+  log(`  combinazioni totali: ${COMBINAZIONI.length}`);
+  log(`  uscita lato perdente: ${CFG.USCITA} dopo ${CFG.USCITA_MIN_S}s`);
+  log("═══════════════════════════════════════════════════");
 
   while (true) {
     const start = roundStart();
