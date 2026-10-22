@@ -1,23 +1,20 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// xpaper.js — PAPER TRADING (nessun ordine reale, ma CONTABILITA' VERA)
+// xpaper.js — PAPER TRADING · VERSIONE SENZA ROTAZIONE
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Differenza da xsignal.js:
-//   xsignal  ASSUME il fill se il prezzo scende <= soglia e STIMA il PnL
-//   xpaper   VERIFICA se il fill ci sarebbe stato davvero (size reale nel book),
-//            usa il PREZZO REALE dell'ask, sottrae la FEE REALE del mercato,
-//            e tiene un PORTAFOGLIO con saldo, posizioni e storico trade.
+// COSA E' CAMBIATO
+//   La rotazione e' stata RIMOSSA. I dati l'hanno bocciata:
+//   19 tentativi, 19 ROT-KO. Comprare il lato "vincente" a 0.66-0.69 ha
+//   valore atteso circa zero (0.66 * 5.00 = 3.30 speso 3.35) e in piu'
+//   paga il book illiquido di fine round.
 //
-// Fix WebSocket (rispetto alla prima versione):
-//   - KEEP-ALIVE: ping ogni 10 s (Polymarket chiude se non riceve traffico)
-//   - nessun socket doppio: il vecchio viene terminato prima di riaprire
-//   - timeout sull'apertura: se non apre entro 15 s, riprova
-//   - riconnessione con backoff, senza timer sovrapposti
+// COSA RESTA
+//   quota 0.44 su UP e DN · 5 share per lato · stop 0.35
+//   fill VERIFICATO sul book reale (size + prezzo dell'ask)
+//   fee REALE dal mercato
+//   se un lato non si riempie entro il tempo massimo -> STOP, nessun altro ordine
 //
-// REGOLA (identica al bot che monteremo):
-//   quota 0.44 · 5 share per lato · stop 0.35
-//   aspetta finche' il lato comprato sta >= 0.35 (minimo 15 s di osservazione)
-//   se perdente < 0.35 e vincente <= 0.70 -> ROTAZIONE, altrimenti STOP
+// E' identico a xpaper, con la sola differenza che la decisione e' sempre STOP.
 
 import WebSocket from "ws";
 import fs from "fs";
@@ -29,17 +26,14 @@ const CFG = {
   SHARES: 5,
   STOP: 0.35,
   SOGLIA_PERDENTE: 0.35,
-  TETTO_VINCENTE: 0.70,
   MIN_DECISION_S: 15,
   MAX_ATTESA_S: 120,
   MIN_SIZE_FILL: 5,
-  MIN_SIZE_USCITA: 5,
   CAPITALE_INIZIALE: 100,
   POLL_MS: 1000,
-  OUT_DIR: "out-paper",
-  // WebSocket
+  OUT_DIR: "out-paper-norot",
   WS_URL: "wss://ws-subscriptions-clob.polymarket.com/ws/market",
-  WS_PING_MS: 10000,       // keep-alive
+  WS_PING_MS: 10000,
   WS_OPEN_TIMEOUT_MS: 15000,
   WS_RECONNECT_MS: 3000,
 };
@@ -62,7 +56,7 @@ function roundStart(now = Date.now()) {
   return Math.floor(now / 1000 / WINDOW) * WINDOW;
 }
 
-// ─── STATO DEL PORTAFOGLIO ─────────────────────────────────────────────────
+// ─── PORTAFOGLIO ───────────────────────────────────────────────────────────
 const wallet = {
   capitale: CFG.CAPITALE_INIZIALE,
   realizzato: 0,
@@ -71,7 +65,7 @@ const wallet = {
   roundSaltati: 0,
 };
 
-// ─── TROVA IL ROUND E LA FEE ───────────────────────────────────────────────
+// ─── ROUND + FEE ───────────────────────────────────────────────────────────
 async function trovaRound(startTs) {
   const slug = `btc-updown-5m-${startTs}`;
   try {
@@ -93,7 +87,7 @@ async function trovaRound(startTs) {
   }
 }
 
-// ─── BOOK REALE (WebSocket robusto) ────────────────────────────────────────
+// ─── BOOK (WebSocket robusto, invariato) ───────────────────────────────────
 class BookReader {
   constructor(tokens) {
     this.tokens = tokens;
@@ -103,13 +97,11 @@ class BookReader {
     this.reconnectTimer = null;
     this.openTimer = null;
     this.chiuso = false;
-    this.wsCaduto = 0;        // contatore, utile nei log
+    this.wsCaduto = 0;
   }
 
   start() {
     if (this.chiuso) return;
-
-    // 1. chiudi SEMPRE il socket vecchio: niente socket doppi
     if (this.ws) {
       try { this.ws.removeAllListeners(); this.ws.terminate(); } catch (_) {}
       this.ws = null;
@@ -118,15 +110,9 @@ class BookReader {
     clearTimeout(this.reconnectTimer);
     clearTimeout(this.openTimer);
 
-    try {
-      this.ws = new WebSocket(CFG.WS_URL);
-    } catch (e) {
-      log("[ws] errore creazione:", e.message);
-      this._riprova();
-      return;
-    }
+    try { this.ws = new WebSocket(CFG.WS_URL); }
+    catch (e) { log("[ws] errore creazione:", e.message); this._riprova(); return; }
 
-    // 2. timeout di apertura: se non apre, riprova
     this.openTimer = setTimeout(() => {
       if (this.ws && this.ws.readyState !== 1) {
         log("[ws] timeout apertura, riprovo");
@@ -142,16 +128,12 @@ class BookReader {
         }));
       } catch (_) {}
       log("[ws] connesso");
-      // 3. KEEP-ALIVE: senza ping Polymarket chiude
       this.pingTimer = setInterval(() => {
-        try {
-          if (this.ws && this.ws.readyState === 1) this.ws.ping();
-        } catch (_) {}
+        try { if (this.ws && this.ws.readyState === 1) this.ws.ping(); } catch (_) {}
       }, CFG.WS_PING_MS);
     });
 
-    this.ws.on("pong", () => { /* connessione viva */ });
-
+    this.ws.on("pong", () => {});
     this.ws.on("message", (raw) => {
       try {
         const msg = JSON.parse(raw.toString());
@@ -167,7 +149,6 @@ class BookReader {
         }
       } catch (_) {}
     });
-
     this.ws.on("close", () => {
       clearInterval(this.pingTimer);
       clearTimeout(this.openTimer);
@@ -176,8 +157,7 @@ class BookReader {
       log(`[ws] chiuso (#${this.wsCaduto}), riconnessione fra ${CFG.WS_RECONNECT_MS / 1000}s`);
       this._riprova();
     });
-
-    this.ws.on("error", () => { /* gestito dal close */ });
+    this.ws.on("error", () => {});
   }
 
   _riprova() {
@@ -197,7 +177,6 @@ class BookReader {
   async leggi(tokenId) {
     if (!tokenId) return null;
     let b = this.books.get(tokenId);
-    // fallback REST se il WS non ha ancora consegnato il book
     if (!b || (!b.bids.length && !b.asks.length)) {
       try {
         const r = await jget(`${CLOB}/book?token_id=${tokenId}`);
@@ -222,7 +201,7 @@ class BookReader {
   }
 }
 
-// ─── SIMULAZIONE DEL FILL ──────────────────────────────────────────────────
+// ─── FILL SIMULATO ─────────────────────────────────────────────────────────
 function simulaFill(book, quota, shares) {
   if (!book || !book.asks.length) return { fillato: false, sizeDisponibile: 0 };
   let rimaste = shares, speso = 0, sizeDisponibile = 0;
@@ -238,7 +217,6 @@ function simulaFill(book, quota, shares) {
   return { fillato: true, prezzo: speso / shares, size: shares, sizeDisponibile };
 }
 
-// ─── FEE ───────────────────────────────────────────────────────────────────
 function feeSuFill(prezzo, shares, feeRate) {
   if (!feeRate) return 0;
   return feeRate * prezzo * (1 - prezzo) * shares;
@@ -270,7 +248,7 @@ async function eseguiRound(r) {
       bidUp: up.bestBid, bidDn: dn.bestBid,
     });
 
-    // 1. FILL (verificato sul book reale)
+    // FILL (verificato sul book reale)
     if (!fillUp) {
       const f = simulaFill(up, CFG.QUOTA, CFG.SHARES);
       if (f.fillato) {
@@ -288,63 +266,35 @@ async function eseguiRound(r) {
       }
     }
 
-    // 2. COPPIA
+    // COPPIA
     if (fillUp && fillDn && !decisione) {
       const speso = fillUp.prezzo * CFG.SHARES + fillDn.prezzo * CFG.SHARES;
       const fee = fillUp.fee + fillDn.fee;
       const netto = CFG.SHARES * 1.0 - speso - fee;
-      decisione = { tipo: "COPPIA", a_secondi: +t.toFixed(1), pnl: r2(netto) };
+      decisione = { tipo: "COPPIA", a_secondi: +t.toFixed(1), speso: r2(speso), pnl: r2(netto) };
       log(`[PAPER] COPPIA chiusa @${t.toFixed(1)}s | speso ${r2(speso)} · fee ${r2(fee)} → NETTO ${netto >= 0 ? "+" : ""}${r2(netto)}`);
     }
 
-    // 3. DECISIONE (dopo il tempo minimo)
+    // STOP — nessuna rotazione
     if (!decisione && !deciso && t >= CFG.MIN_DECISION_S) {
       const dentroUp = fillUp !== null, dentroDn = fillDn !== null;
       if (dentroUp !== dentroDn) {
         const comprato = dentroUp ? "UP" : "DN";
-        const mancato  = dentroUp ? "DN" : "UP";
         const bookComprato = dentroUp ? up : dn;
-        const bookMancato  = dentroUp ? dn : up;
         const pComp = bookComprato.bestBid;
-        const pManc = bookMancato.bestAsk;
-        const sizeUscita = bookComprato.bids.length ? bookComprato.bids[0][1] : 0;
         const scaduto = t >= CFG.MAX_ATTESA_S;
 
         if ((pComp !== null && pComp < CFG.SOGLIA_PERDENTE) || scaduto) {
-          const ruota = (pComp !== null && pComp < CFG.SOGLIA_PERDENTE) &&
-                        (pManc !== null && pManc <= CFG.TETTO_VINCENTE) &&
-                        (sizeUscita >= CFG.MIN_SIZE_USCITA);
-          if (ruota) {
-            const fillV = simulaFill(bookMancato, pManc, CFG.SHARES);
-            if (fillV.fillato) {
-              const fillP = dentroUp ? fillUp : fillDn;
-              const incasso = CFG.SHARES * pComp;
-              const spesaV = CFG.SHARES * fillV.prezzo;
-              const feeV = feeSuFill(fillV.prezzo, CFG.SHARES, r.feeRate);
-              const feeP = feeSuFill(pComp, CFG.SHARES, r.feeRate);
-              decisione = {
-                tipo: "ROT", a_secondi: +t.toFixed(1),
-                comprato, mancato,
-                prezzo_perdente: r2(pComp), prezzo_vincente: r2(fillV.prezzo),
-                _incasso_perdente: incasso, _spesa_vincente: spesaV,
-                _speso_comprato: fillP.prezzo * CFG.SHARES,
-                _fee: feeV + feeP,
-              };
-              log(`[PAPER] ROTAZIONE @${t.toFixed(1)}s: vendi ${comprato}@${r2(pComp)} (size ${Math.round(sizeUscita)}), compra ${mancato}@${r2(fillV.prezzo)}`);
-            }
-          } else {
-            const fillP = dentroUp ? fillUp : fillDn;
-            const uscita = CFG.SHARES * (pComp ?? 0);
-            const speso = fillP.prezzo * CFG.SHARES;
-            const fee = fillP.fee + feeSuFill(pComp ?? 0, CFG.SHARES, r.feeRate);
-            decisione = {
-              tipo: "STOP", a_secondi: +t.toFixed(1),
-              comprato, prezzo_perdente: pComp !== null ? r2(pComp) : null,
-              prezzo_vincente: pManc !== null ? r2(pManc) : null,
-              _pnl: r2(uscita - speso - fee),
-            };
-            log(`[PAPER] STOP @${t.toFixed(1)}s: ${comprato} a ${pComp !== null ? r2(pComp) : "n/d"} → uscita ${r2(uscita)}`);
-          }
+          const fillP = dentroUp ? fillUp : fillDn;
+          const uscita = CFG.SHARES * (pComp ?? 0);
+          const speso = fillP.prezzo * CFG.SHARES;
+          const fee = fillP.fee + feeSuFill(pComp ?? 0, CFG.SHARES, r.feeRate);
+          decisione = {
+            tipo: "STOP", a_secondi: +t.toFixed(1),
+            comprato, prezzo_perdente: pComp !== null ? r2(pComp) : null,
+            _pnl: r2(uscita - speso - fee),
+          };
+          log(`[PAPER] STOP @${t.toFixed(1)}s: ${comprato} a ${pComp !== null ? r2(pComp) : "n/d"} → uscita ${r2(uscita)}`);
           deciso = true;
         }
       }
@@ -358,10 +308,8 @@ async function eseguiRound(r) {
 
   reader.stop();
 
-  // 4. LIQUIDAZIONE
+  // LIQUIDAZIONE a fine round se non si e' deciso
   const ultimo = tick[tick.length - 1] || {};
-  const upFinale = ultimo.up ?? null, dnFinale = ultimo.dn ?? null;
-
   if (!decisione && (fillUp || fillDn)) {
     const fillP = fillUp || fillDn;
     const latoP = fillUp ? "up" : "dn";
@@ -374,32 +322,14 @@ async function eseguiRound(r) {
   let pnlRound = null, tipo = "NON_OPERATO";
   if (decisione) {
     if (decisione.tipo === "COPPIA") { pnlRound = decisione.pnl; tipo = "COPPIA"; }
-    else if (decisione.tipo === "ROT") {
-      // CHI HA VINTO: lo decidiamo dal prezzo finale (il lato a 1,00 e' il vincitore)
-      let vincente = null;
-      if (upFinale !== null && dnFinale !== null) {
-        vincente = upFinale > dnFinale ? "UP" : "DN";
-      }
-      const haVinto = vincente === decisione.mancato;
-      const valoreVincente = haVinto ? CFG.SHARES * 1.0 : 0;
-      pnlRound = r2((decisione._incasso_perdente ?? 0)
-                    + valoreVincente
-                    - (decisione._spesa_vincente ?? 0)
-                    - (decisione._speso_comprato ?? 0)
-                    - (decisione._fee ?? 0));
-      tipo = `ROT-${haVinto ? "OK" : "KO"}`;
-      decisione.vincente_reale = vincente;
-      decisione.pnl = pnlRound;
-    }
-    else if (decisione.tipo === "STOP") { pnlRound = decisione._pnl; tipo = "STOP"; }
-    else { pnlRound = decisione._pnl; tipo = "FINE"; }
+    else { pnlRound = decisione._pnl; tipo = decisione.tipo === "STOP" ? "STOP" : "FINE"; }
   }
 
   if (pnlRound !== null) {
     wallet.realizzato += pnlRound;
     wallet.capitale = r2(CFG.CAPITALE_INIZIALE + wallet.realizzato);
     wallet.roundOperati++;
-    wallet.trade.push({ slug: r.slug, tipo, pnl: pnlRound, decisione: decisione?.a_secondi ?? null });
+    wallet.trade.push({ slug: r.slug, tipo, pnl: pnlRound });
   } else {
     wallet.roundSaltati++;
   }
@@ -426,7 +356,7 @@ function riepilogo() {
     perTipo[t.tipo] = perTipo[t.tipo] ?? { n: 0, pnl: 0 };
     perTipo[t.tipo].n++; perTipo[t.tipo].pnl += t.pnl;
   }
-  log("\n════ RIEPILOGO PAPER ════");
+  log("\n════ RIEPILOGO PAPER (senza rotazione) ════");
   log(`round operati: ${wallet.roundOperati} | saltati: ${wallet.roundSaltati}`);
   log(`capitale: ${CFG.CAPITALE_INIZIALE} → ${wallet.capitale} $`);
   log(`PnL realizzato: ${wallet.realizzato >= 0 ? "+" : ""}${r2(wallet.realizzato)} $`);
@@ -434,18 +364,17 @@ function riepilogo() {
   for (const [k, v] of Object.entries(perTipo)) {
     log(`  ${k}: ${v.n} round · ${v.pnl >= 0 ? "+" : ""}${r2(v.pnl)} $`);
   }
-  log("════════════════════════");
+  log("═══════════════════════════════════════════");
 }
 
 // ─── MAIN ──────────────────────────────────────────────────────────────────
 async function main() {
   log("═══════════════════════════════════════════════════════");
-  log("  xpaper — PAPER TRADING (nessun ordine reale)");
+  log("  xpaper — PAPER TRADING · SENZA ROTAZIONE");
   log("═══════════════════════════════════════════════════════");
   log(`  quota ${CFG.QUOTA} · ${CFG.SHARES} share per lato · stop ${CFG.STOP}`);
-  log(`  decisione: min ${CFG.MIN_DECISION_S}s · perdente <${CFG.SOGLIA_PERDENTE} e vincente <=${CFG.TETTO_VINCENTE} → ROT`);
+  log(`  decisione: min ${CFG.MIN_DECISION_S}s · lato non riempito → STOP`);
   log(`  capitale fittizio: ${CFG.CAPITALE_INIZIALE} $`);
-  log(`  ws: ping ogni ${CFG.WS_PING_MS / 1000}s · timeout apertura ${CFG.WS_OPEN_TIMEOUT_MS / 1000}s`);
   log("═══════════════════════════════════════════════════════");
 
   while (true) {
