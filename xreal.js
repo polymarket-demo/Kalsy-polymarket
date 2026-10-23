@@ -23,7 +23,7 @@ const CFG = {
   USCITA: 0.40,            // taglia il lato perdente
   USCITA_MIN_S: 60,        // non uscire prima di 60s dal fill
   PREZZO_MIN_FILL: 0.25,
-  MAX_ROUNDS: 3,           // ← 3 round e poi esce (per l'upload)
+  MAX_ROUNDS: 10,           // ← 10 round e poi esce (per l'upload)
   POLL_MS: 1000,
   FILTRO_ON: true,         // ← se il round parte sbilanciato NON entra
   FILTRO_SOMMA_MIN: 0.70,  // somma dei due ask sotto questa soglia = round gia' deciso
