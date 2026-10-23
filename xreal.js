@@ -240,6 +240,7 @@ async function eseguiRound(r) {
   let sommaInizio = null;
   let tFillUp = null, tFillDn = null;
   let minUp = 9, minDn = 9;
+  let aggAvvisato = false;
 
   while (Math.floor(Date.now() / 1000) - inizio < WINDOW) {
     const t = (Date.now() - inizio * 1000) / 1000;
@@ -283,8 +284,15 @@ async function eseguiRound(r) {
       }
     }
 
-    // ── AGGIUNTA: sul lato posseduto che sale oltre 0.50, MAI sopra la soglia
-    if (!agg && posizioni.length) {
+    // ── AGGIUNTA: SOLO se ho un lato solo (scoperto).
+    //    Se la coppia e' completa NON si compra piu' nulla: la coppia e' gia'
+    //    matematica (uno dei due lati paga 1.00) e aggiungere raddoppia il
+    //    rischio senza aumentare la copertura. Si aspetta la scadenza.
+    if (posizioni.length >= 2 && !agg && !aggAvvisato) {
+      aggAvvisato = true;
+      log(`    ⊘ coppia completa → nessuna aggiunta, si aspetta la scadenza`);
+    }
+    if (!agg && posizioni.length === 1) {
       for (const p of posizioni) {
         const book = p.lato === "up" ? up : dn;
         const ask = book.bestAsk;
