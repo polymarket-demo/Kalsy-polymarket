@@ -28,6 +28,10 @@ const CFG = {
   AGG_DOPO_S: 90,          // ← l'aggiunta parte solo DOPO 90s dal primo fill,
                            //    e solo se sono ancora scoperto (un lato solo).
                            //    Così si dà tempo al secondo lato di formare la coppia.
+  AGG_BID_MIN: 0.42,       // ← e solo se il lato e' ANCORA VIVO: il suo bestBid
+                           //    deve stare sopra questa soglia. Se il lato e' gia'
+                           //    in discesa (bid sotto 0.42) NON si aggiunge:
+                           //    sarebbe raddoppiare su un lato che sta perdendo.
   TRAILING: 0.90,          // esce se il bid tocca 0.90 e poi riscende
   USCITA: 0.40,            // taglia il lato perdente (solo se e' solo)
   USCITA_MIN_S: 60,        // non uscire prima di 60s dal fill
@@ -307,6 +311,17 @@ async function eseguiRound(r) {
       for (const p of posizioni) {
         const book = p.lato === "up" ? up : dn;
         const ask = book.bestAsk;
+        const bidLato = book.bestBid;
+        // GUARDIA: il lato deve essere ANCORA VIVO. Se il bid e' gia' sceso
+        // sotto AGG_BID_MIN, il lato sta perdendo -> aggiungere sarebbe
+        // raddoppiare su una posizione in discesa. Non si aggiunge.
+        if (bidLato !== null && bidLato < CFG.AGG_BID_MIN) {
+          if (!aggAvvisato) {
+            aggAvvisato = true;
+            log(`    ⊘ lato ${p.lato} gia' in discesa (bid ${bidLato} < ${CFG.AGG_BID_MIN}) → nessuna aggiunta`);
+          }
+          break;
+        }
         if (ask !== null && ask >= CFG.SOGLIA_AGG && ask < 0.97) {
           const prezzoFill = Math.min(ask, CFG.SOGLIA_AGG);
           if (book.askSize >= CFG.SHARES_AGG && prezzoFill * CFG.SHARES_AGG <= PF.contante) {
