@@ -1,32 +1,29 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// xpaper.js — PAPER TRADING · v7.2
-// MULTI-QUOTA + MULTI-SOGLIA + MULTI-TRAILING · con USCITA AUTOMATICA
+// xpaper.js — PAPER TRADING · v7.3
+// MULTI-QUOTA + MULTI-SOGLIA + MULTI-TRAILING · CSV COMPLETI · MAX_ROUNDS
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// NOVITA' v7.2 (l'unica modifica rispetto alla v7.1):
-//   MAX_ROUNDS — il bot fa N round, stampa il riepilogo e ESCE.
-//   Serve perche' il workflow GitHub mette l'upload degli artifact DOPO il
-//   `run: node xpaper.js`: se il bot gira in ciclo infinito, l'upload non
-//   parte mai e lo zip non arriva.
-//   Con MAX_ROUNDS = 6 la run dura ~30 minuti, esce, e l'upload parte subito.
+// NOVITA' v7.3 (rispetto alla v7.2) — due correzioni al salvataggio:
 //
-// COSA MISURA (tutto in parallelo sullo stesso round, book reale)
+//   1. quote.csv scrive UNA RIGA PER OGNI COMBINAZIONE (156 righe per round),
+//      non solo le 6 quote base. Cosi' nei CSV c'e' anche l'entrata a 0.55,
+//      ogni soglia di aggiunta e ogni trailing.
+//      Colonne: slug, esito, combinazione(quota|agg|trail), coppie, mancate,
+//               aggOK, aggKO, aggTRAIL, pnl_cumulato
+//
+//   2. Il file dei TICK per ogni round viene scritto SEMPRE, anche se il round
+//      viene saltato (un lato mancante). Prima la `return` anticipata lo
+//      impediva, e negli zip c'erano solo poche centinaia di byte.
+//
+// COSA TESTA
 //   quota     0.35 0.37 0.40 0.42 0.44 0.47
 //   soglia agg 0.50 0.55 0.60 0.65 0.70
 //   trailing   0.70 0.75 0.80 0.85 0.90
-//   -> 156 combinazioni, ognuna con il suo portafoglio virtuale da 100 $
 //
-// REGOLA
-//   compra 5 share UP e 5 DN alla quota (limit, MAKER se al livello)
-//   attesa lunga: la coppia ha tutto il round
-//   se un lato posseduto supera la soglia agg -> +5 share su quel lato
-//   l'aggiunta sale fino a >= trailing, poi se riscende a trailing -> VENDO
-//   uscita sul lato perdente a 0.40, non prima di 60 s
-//   nessuna rotazione
-//
-// RISULTATI ATTESI (dai 20 round del 22/10):
-//   MIGLIORE: 0.44 | agg 0.50 | trail 0.85 -> +13.85 $ / 20 round (+0.693)
-//   aggiunte: 5 vinte · 0 perse · 3 chiuse dal trailing · win 92.3%
+// RISULTATI NOTI (38 round, 22 ott):
+//   19:35-20:25 → migliore 0.44|0.50|0.85 → +13.85 $  (+0.693/round)
+//   20:30-21:15 → migliore 0.35          → +2.25 $
+//   21:30-22:05 → migliore 0.47|0.50|0.90 → -3.95 $  (6 round, 0 coppie)
 // ═══════════════════════════════════════════════════════════════════════════
 
 import WebSocket from "ws";
@@ -46,7 +43,7 @@ const CFG = {
   CAPITALE_INIZIALE: 100,
   POLL_MS: 1000,
   RIEPILOGO_OGNI: 10,
-  MAX_ROUNDS: 6,           // <-- esce dopo N round, cosi' l'upload parte
+  MAX_ROUNDS: 6,           // esce dopo N round validi, cosi' l'upload parte
   OUT_DIR: "out-paper",
   WS_URL: "wss://ws-subscriptions-clob.polymarket.com/ws/market",
   WS_PING_MS: 10000,
@@ -190,6 +187,18 @@ function simulaFill(book, quota, shares) {
 function ruoloFill(p, quota) { return Math.abs(p - quota) < 0.005 ? "MAKER" : "TAKER"; }
 function feeSuFill(p, shares, feeRate) { if (!feeRate) return 0; return feeRate * p * (1 - p) * shares; }
 
+// ─── SALVA I TICK DEL ROUND (sempre, anche se saltato) ─────────────────────
+function salvaTick(slug, tick) {
+  try {
+    fs.mkdirSync(CFG.OUT_DIR, { recursive: true });
+    fs.writeFileSync(path.join(CFG.OUT_DIR, `${slug}.csv`),
+      "t,up_ask,up_size,dn_ask,dn_size,up_bid,dn_bid\n" +
+      tick.map((x) => [x.t, x.up ?? "", Math.round(x.up ? x.askUp : 0),
+                       x.dn ?? "", Math.round(x.dn ? x.askDn : 0),
+                       x.bidUp ?? "", x.bidDn ?? ""].join(",")).join("\n"));
+  } catch (e) { log("[err] salvaTick:", e.message); }
+}
+
 // ─── UN ROUND ──────────────────────────────────────────────────────────────
 async function eseguiRound(r) {
   log(`\n${"=".repeat(70)}`);
@@ -276,6 +285,9 @@ async function eseguiRound(r) {
   }
   reader.stop();
 
+  // I TICK SI SALVANO SEMPRE — anche se il round viene saltato
+  salvaTick(r.slug, tick);
+
   const upMin = Math.min(...tick.map((x) => x.up ?? 9));
   const dnMin = Math.min(...tick.map((x) => x.dn ?? 9));
   const esitoMercato = (upMin <= 0.44 && dnMin <= 0.44) ? "COPPIA" : "UN_LATO";
@@ -283,8 +295,8 @@ async function eseguiRound(r) {
   const latoMancante = upMin >= 1 || dnMin >= 1;
 
   if (latoMancante) {
-    log(`    ⚠ round SALTATO: un lato non ha mai avuto prezzo (UP min ${upMin} | DN min ${dnMin})`);
-    return;
+    log(`    ⚠ round SALTATO (tick salvati): un lato non ha mai avuto prezzo (UP min ${upMin} | DN min ${dnMin})`);
+    return;   // i tick sono gia' su disco
   }
 
   for (const s of stato.values()) {
@@ -325,14 +337,16 @@ async function eseguiRound(r) {
   const w44 = wallets.get("0.44|0.55|0.75");
   if (w44) log(`    0.44|agg0.55|tr0.75 → coppie ${w44.coppie} (mancate ${w44.coppieMancate}) | PNL ${w44.realizzato >= 0 ? "+" : ""}${r2(w44.realizzato)} $`);
 
-  if (roundFatti % CFG.RIEPILOGO_OGNI === 0) riepilogo();
-
+  // ── CSV COMPLETO: una riga per OGNI combinazione ──
   fs.mkdirSync(CFG.OUT_DIR, { recursive: true });
-  fs.appendFileSync(path.join(CFG.OUT_DIR, "quote.csv"),
-    [r.slug, esitoMercato, upMin, dnMin, ...CFG.QUOTE.map((q) => {
-      const w = wallets.get(`${q.toFixed(2)}|noagg`);
-      return `${q.toFixed(2)}:${w.coppie}:${w.coppieMancate}:${r2(w.realizzato)}`;
-    })].join(",") + "\n");
+  const righe = [];
+  for (const [id, w] of wallets) {
+    righe.push([r.slug, esitoMercato, id, w.coppie, w.coppieMancate,
+                w.aggOk, w.aggKo, w.aggTrail, r2(w.realizzato)].join(","));
+  }
+  fs.appendFileSync(path.join(CFG.OUT_DIR, "quote.csv"), righe.join("\n") + "\n");
+
+  if (roundFatti % CFG.RIEPILOGO_OGNI === 0) riepilogo();
 }
 
 // ─── RIEPILOGO ─────────────────────────────────────────────────────────────
@@ -386,12 +400,13 @@ function riepilogo() {
 // ─── MAIN — esce dopo MAX_ROUNDS ───────────────────────────────────────────
 async function main() {
   log("═══════════════════════════════════════════════════════");
-  log("  xpaper — PAPER v7.2 (esce dopo N round)");
+  log("  xpaper — PAPER v7.3 · CSV COMPLETI");
   log("═══════════════════════════════════════════════════════");
   log(`  quote: ${CFG.QUOTE.map((q) => q.toFixed(2)).join(" · ")}`);
   log(`  soglie agg: ${CFG.SOGLIE_AGG.map((s) => s.toFixed(2)).join(" · ")}`);
   log(`  trailing: ${CFG.TRAILINGS.map((s) => s.toFixed(2)).join(" · ")}`);
   log(`  ${COMBINAZIONI.length} combinazioni · MAX_ROUNDS ${CFG.MAX_ROUNDS}`);
+  log(`  CSV: quote.csv = 1 riga per combinazione · <slug>.csv = tick (sempre)`);
   log("═══════════════════════════════════════════════════");
 
   let fatti = 0, tentativi = 0;
@@ -406,7 +421,7 @@ async function main() {
     }
     const prima = roundFatti;
     try { await eseguiRound(r); } catch (e) { log("[err]", e.message); }
-    if (roundFatti > prima) fatti++;       // conta solo i round validi
+    if (roundFatti > prima) fatti++;
     await sleep(Math.max(1000, (start + WINDOW) * 1000 - Date.now() + 2000));
   }
 
