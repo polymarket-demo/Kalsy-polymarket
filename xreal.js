@@ -21,8 +21,13 @@ const CFG = {
   CAPITALE: 50,            // portafoglio DEMO di partenza
   SHARES: 5,               // share per lato all'apertura
   SHARES_AGG: 5,           // share per l'aggiunta
-  QUOTA: 0.44,             // entrata: ogni lato entra quando bestAsk <= 0.44
+  QUOTA: 0.46,             // entrata: ogni lato entra quando bestAsk <= 0.46
+                           //   (0.46 = più coppie della 0.44 e costo medio
+                           //    più basso: 38/57 coppie a 4.89 $ contro 35 a 4.97)
   SOGLIA_AGG: 0.50,        // aggiunta: parte quando bestAsk >= 0.50
+  AGG_DOPO_S: 90,          // ← l'aggiunta parte solo DOPO 90s dal primo fill,
+                           //    e solo se sono ancora scoperto (un lato solo).
+                           //    Così si dà tempo al secondo lato di formare la coppia.
   TRAILING: 0.90,          // esce se il bid tocca 0.90 e poi riscende
   USCITA: 0.40,            // taglia il lato perdente (solo se e' solo)
   USCITA_MIN_S: 60,        // non uscire prima di 60s dal fill
@@ -292,7 +297,13 @@ async function eseguiRound(r) {
       aggAvvisato = true;
       log(`    ⊘ coppia completa → nessuna aggiunta, si aspetta la scadenza`);
     }
+    //    Inoltre parte solo DOPO AGG_DOPO_S secondi dal primo fill: cosi' si da
+    //    tempo al secondo lato di formare la coppia prima di aggiungere.
     if (!agg && posizioni.length === 1) {
+      const p0 = posizioni[0];
+      if ((t - p0.t) < CFG.AGG_DOPO_S) {
+        // ancora dentro la finestra di attesa: non aggiungere
+      } else
       for (const p of posizioni) {
         const book = p.lato === "up" ? up : dn;
         const ask = book.bestAsk;
