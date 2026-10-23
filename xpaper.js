@@ -1,22 +1,32 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// xpaper.js — PAPER TRADING · v7.1
-// MULTI-QUOTA + MULTI-SOGLIA AGGIUNTA + MULTI-TRAILING + RIEPILOGO PERIODICO
+// xpaper.js — PAPER TRADING · v7.2
+// MULTI-QUOTA + MULTI-SOGLIA + MULTI-TRAILING · con USCITA AUTOMATICA
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// NOVITA' v7.1 (rispetto alla v7):
-//   1. RIEPILOGO OGNI N ROUND (default 10) — le tabelle si vedono MENTRE gira,
-//      non solo alla fine.
-//   2. Colonna "coppie MANCATE": round dove il mercato ha chiuso COPPIA ma
-//      noi eravamo gia' usciti. Misura quanto costa uscire troppo presto.
-//   3. Nel riepilogo periodico, le tre classifiche:
-//        - migliori combinazioni (quota | agg | trail)
-//        - miglior SOGLIA DI AGGIUNTA (media)
-//        - miglior TRAILING (media)
+// NOVITA' v7.2 (l'unica modifica rispetto alla v7.1):
+//   MAX_ROUNDS — il bot fa N round, stampa il riepilogo e ESCE.
+//   Serve perche' il workflow GitHub mette l'upload degli artifact DOPO il
+//   `run: node xpaper.js`: se il bot gira in ciclo infinito, l'upload non
+//   parte mai e lo zip non arriva.
+//   Con MAX_ROUNDS = 6 la run dura ~30 minuti, esce, e l'upload parte subito.
 //
-// COSA TESTA (tutto in parallelo sullo stesso round, book reale)
+// COSA MISURA (tutto in parallelo sullo stesso round, book reale)
 //   quota     0.35 0.37 0.40 0.42 0.44 0.47
 //   soglia agg 0.50 0.55 0.60 0.65 0.70
 //   trailing   0.70 0.75 0.80 0.85 0.90
+//   -> 156 combinazioni, ognuna con il suo portafoglio virtuale da 100 $
+//
+// REGOLA
+//   compra 5 share UP e 5 DN alla quota (limit, MAKER se al livello)
+//   attesa lunga: la coppia ha tutto il round
+//   se un lato posseduto supera la soglia agg -> +5 share su quel lato
+//   l'aggiunta sale fino a >= trailing, poi se riscende a trailing -> VENDO
+//   uscita sul lato perdente a 0.40, non prima di 60 s
+//   nessuna rotazione
+//
+// RISULTATI ATTESI (dai 20 round del 22/10):
+//   MIGLIORE: 0.44 | agg 0.50 | trail 0.85 -> +13.85 $ / 20 round (+0.693)
+//   aggiunte: 5 vinte · 0 perse · 3 chiuse dal trailing · win 92.3%
 // ═══════════════════════════════════════════════════════════════════════════
 
 import WebSocket from "ws";
@@ -35,7 +45,8 @@ const CFG = {
   PREZZO_MIN_FILL: 0.25,
   CAPITALE_INIZIALE: 100,
   POLL_MS: 1000,
-  RIEPILOGO_OGNI: 10,      // <-- stampa il riepilogo ogni N round
+  RIEPILOGO_OGNI: 10,
+  MAX_ROUNDS: 6,           // <-- esce dopo N round, cosi' l'upload parte
   OUT_DIR: "out-paper",
   WS_URL: "wss://ws-subscriptions-clob.polymarket.com/ws/market",
   WS_PING_MS: 10000,
@@ -114,6 +125,7 @@ class BookReader {
     this.ws.on("open", () => {
       clearTimeout(this.openTimer);
       try { this.ws.send(JSON.stringify({ type: "subscribe", channel: "book", assets_ids: this.tokens })); } catch (_) {}
+      log("[ws] connesso");
       this.pingTimer = setInterval(() => { try { if (this.ws && this.ws.readyState === 1) this.ws.ping(); } catch (_) {} }, CFG.WS_PING_MS);
     });
     this.ws.on("pong", () => {});
@@ -133,7 +145,9 @@ class BookReader {
     });
     this.ws.on("close", () => {
       clearInterval(this.pingTimer); clearTimeout(this.openTimer); this.wsCaduto++;
-      if (this.chiuso) return; this._riprova();
+      if (this.chiuso) return;
+      log(`[ws] chiuso (#${this.wsCaduto}), riconnessione`);
+      this._riprova();
     });
     this.ws.on("error", () => {});
   }
@@ -266,13 +280,10 @@ async function eseguiRound(r) {
   const dnMin = Math.min(...tick.map((x) => x.dn ?? 9));
   const esitoMercato = (upMin <= 0.44 && dnMin <= 0.44) ? "COPPIA" : "UN_LATO";
   const ultimo = tick[tick.length - 1] || {};
-
-  // round non valido: un lato mai letto
   const latoMancante = upMin >= 1 || dnMin >= 1;
+
   if (latoMancante) {
     log(`    ⚠ round SALTATO: un lato non ha mai avuto prezzo (UP min ${upMin} | DN min ${dnMin})`);
-    roundFatti++;
-    if (roundFatti % CFG.RIEPILOGO_OGGI !== 0) return;
     return;
   }
 
@@ -304,7 +315,6 @@ async function eseguiRound(r) {
     if (s.decisione.tipo === "COPPIA") { w.coppie++; w.costoTotCoppie += s.decisione.costo; w.pnlCoppie += pnl; }
     else {
       w.unLato++; w.pnlUnLato += pnl;
-      // il mercato ha chiuso coppia ma noi eravamo fuori -> coppia mancata
       if (esitoMercato === "COPPIA") w.coppieMancate++;
     }
   }
@@ -312,8 +322,6 @@ async function eseguiRound(r) {
   roundFatti++;
   log(`>>> ${r.slug}`);
   log(`    esito mercato: ${esitoMercato} | UP min ${upMin} | DN min ${dnMin} | ws caduti ${reader.wsCaduto}`);
-
-  // riga compatta: la combinazione migliore fino a qui + le tre medie
   const w44 = wallets.get("0.44|0.55|0.75");
   if (w44) log(`    0.44|agg0.55|tr0.75 → coppie ${w44.coppie} (mancate ${w44.coppieMancate}) | PNL ${w44.realizzato >= 0 ? "+" : ""}${r2(w44.realizzato)} $`);
 
@@ -333,7 +341,6 @@ function riepilogo() {
     const n = w.coppie + w.unLato;
     return { id: w.id, quota: w.quota, sogliaAgg: w.sogliaAgg, trailing: w.trailing,
       round: n, coppie: w.coppie, coppieMancate: w.coppieMancate,
-      tasso: n ? +(100 * w.coppie / n).toFixed(1) : 0,
       aggOk: w.aggOk, aggKo: w.aggKo, aggTrail: w.aggTrail,
       PNL: r2(w.realizzato), perRound: n ? r3(w.realizzato / n) : 0, saldo: w.capitale };
   }).sort((a, b) => b.PNL - a.PNL);
@@ -343,11 +350,8 @@ function riepilogo() {
   for (const x of righe.slice(0, 10)) {
     log(`  ${x.quota.toFixed(2)} | agg ${(x.sogliaAgg ?? "no").toString().padEnd(4)} | tr ${(x.trailing ?? " -").toString().padEnd(4)} | ` +
         `coppie ${String(x.coppie).padStart(3)} (mancate ${String(x.coppieMancate).padStart(2)}) | ` +
-        `agg ${x.aggOk}/${x.aggKo}/${x.aggTrail} | PNL ${(x.PNL >= 0 ? "+" : "") + x.PNL.toFixed(2)} | ` +
-        `per round ${x.perRound}`);
+        `agg ${x.aggOk}/${x.aggKo}/${x.aggTrail} | PNL ${(x.PNL >= 0 ? "+" : "") + x.PNL.toFixed(2)} | per round ${x.perRound}`);
   }
-
-  // per soglia di aggiunta
   const perSoglia = {};
   for (const x of righe) {
     if (x.sogliaAgg === null) continue;
@@ -363,7 +367,6 @@ function riepilogo() {
   })).sort((a, b) => b.pnlMedio - a.pnlMedio)
     .forEach((x) => log(`  metti size a ${x.soglia.toFixed(2)} → PNL medio ${x.pnlMedio >= 0 ? "+" : ""}${x.pnlMedio} $ | OK ${x.ok} KO ${x.ko} TRAIL ${x.tr} | win ${x.win}%`));
 
-  // per trailing
   const perTrail = {};
   for (const x of righe) {
     if (x.trailing === null) continue;
@@ -380,24 +383,36 @@ function riepilogo() {
   log("══════════════════════════════════════════");
 }
 
-// ─── MAIN ──────────────────────────────────────────────────────────────────
+// ─── MAIN — esce dopo MAX_ROUNDS ───────────────────────────────────────────
 async function main() {
   log("═══════════════════════════════════════════════════════");
-  log("  xpaper — PAPER v7.1");
+  log("  xpaper — PAPER v7.2 (esce dopo N round)");
   log("═══════════════════════════════════════════════════════");
   log(`  quote: ${CFG.QUOTE.map((q) => q.toFixed(2)).join(" · ")}`);
   log(`  soglie agg: ${CFG.SOGLIE_AGG.map((s) => s.toFixed(2)).join(" · ")}`);
   log(`  trailing: ${CFG.TRAILINGS.map((s) => s.toFixed(2)).join(" · ")}`);
-  log(`  ${COMBINAZIONI.length} combinazioni · riepilogo ogni ${CFG.RIEPILOGO_OGNI} round`);
+  log(`  ${COMBINAZIONI.length} combinazioni · MAX_ROUNDS ${CFG.MAX_ROUNDS}`);
   log("═══════════════════════════════════════════════════");
 
-  while (true) {
+  let fatti = 0, tentativi = 0;
+  while (fatti < CFG.MAX_ROUNDS && tentativi < CFG.MAX_ROUNDS * 4) {
+    tentativi++;
     const start = roundStart();
     const r = await trovaRound(start);
-    if (!r || !r.upToken || !r.dnToken) { log(`[wait] round ${start} non trovato`); await sleep(15000); continue; }
+    if (!r || !r.upToken || !r.dnToken) {
+      log(`[wait] round ${start} non trovato`);
+      await sleep(15000);
+      continue;
+    }
+    const prima = roundFatti;
     try { await eseguiRound(r); } catch (e) { log("[err]", e.message); }
+    if (roundFatti > prima) fatti++;       // conta solo i round validi
     await sleep(Math.max(1000, (start + WINDOW) * 1000 - Date.now() + 2000));
   }
+
+  riepilogo();
+  log(`\n[exit] fatti ${fatti} round validi su ${tentativi} tentativi — il job termina, l'upload parte`);
+  process.exit(0);
 }
 
 process.on("SIGINT", () => { riepilogo(); process.exit(0); });
