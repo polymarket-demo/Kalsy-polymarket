@@ -1,27 +1,27 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// xreal.js — v3.0 · PAPER con CONTABILITÀ CORRETTA
+// xreal.js — v4.0 · PAPER DEMO · ESITO LETTO DALLA FONTE VERA
 //
-// COSA ERA SBAGLIATO NELLA v2
-//   Il bot non scalava il costo del secondo lato della coppia quando chiudeva
-//   il round: accreditava il ricavo (5,00) senza sottrarre il costo sostenuto.
-//   Risultato: ogni coppia sembrava un guadagno e il riepilogo saliva da solo.
-//   Il riepilogo diceva +86,80 $ su 50 round; il conto vero sui tick era -24,52 $.
+// COSA ERA SBAGLIATO NELLA v3
+//   Il bot decideva chi aveva vinto confrontando i due best ask finali del
+//   book. Ma a fine round il book e' svuotato: restano residui a 0,00-0,01,
+//   e il confronto tra 0,01 e 0,001 NON e' il risultato del mercato.
+//   Verificato contro Polymarket: 3 esiti sbagliati su 9 round (67% giusti).
+//   Ogni esito sbagliato = un incasso "1.00" inventato su un lato che aveva
+//   perso -> il PNL v3 e' gonfiato e inaffidabile.
 //
 // COSA FA QUESTA VERSIONE
-//   1. UNA sola fonte di verità: il contante. Ogni round parte da `contante` e
-//      torna a `contante`. Il PNL del round e' saldoDopo - saldoPrima, sempre.
-//   2. Ogni posizione aperta ha un `costo` e resta in una lista `aperte` finche'
-//      non viene chiusa (uscita, trailing, o scadenza). Quando si chiude,
-//      si incassa il valore reale e si toglie il costo. Mai due volte.
-//   3. A fine round TUTTE le posizioni residue vengono liquidate (vince = 1.00,
-//      perde = 0) e il contante aggiornato. Nessuna posizione "dimenticata".
-//   4. Il riepilogo NON ricalcola: legge il contante. Se contante + aperte !=
-//      capitale + somma(pnl dei round), il run e' incoerente e lo dichiara.
-//   5. Controllo di quadratura a fine run: la somma dei PNL di tutti i round
-//      deve coincidere col saldo. Se non coincide, lo scrive nel riepilogo e
-//      nel log con "QUADRATURA FALLITA" invece di nasconderlo.
+//   1. A fine round legge l'esito VERO dal mercato (Gamma API):
+//      outcomePrices = ["1","0"] -> ha vinto UP ; ["0","1"] -> ha vinto DOWN.
+//      Se la lettura fallisce, il round viene marcato ESITO_NON_LETTO e le
+//      posizioni residue vengono chiuse al VALORE OSSERVATO (non a 1.00):
+//      meglio un round incerto che un round inventato.
+//   2. Il PNL di ogni round viene scritto nel CSV INSIEME all'esito letto,
+//      cosi' e' verificabile riga per riga contro il sito.
+//   3. Contabilità a fonte unica (come v3) + quadratura dichiarata.
+//   4. `esiti.csv` registra slug, esito letto da Gamma, esito dedotto dai
+//      tick, e se i due coincidono: il confronto e' esplicito nel run.
 //
-// DATI: reali (WebSocket Polymarket). PORTAFOGLIO: demo. ORDINI: simulati.
+// DATI: reali (WebSocket + Gamma). PORTAFOGLIO: demo. ORDINI: simulati.
 // ═══════════════════════════════════════════════════════════════════════════
 
 import WebSocket from "ws";
@@ -33,14 +33,14 @@ const CFG = {
   SHARES: 5,
   SHARES_AGG: 5,
   QUOTA: 0.46,
+  PREZZO_MIN_FILL: 0.25,   // NON comprare sotto questo prezzo (residui del book)
   SOGLIA_AGG: 0.50,
   AGG_DOPO_S: 90,
   AGG_BID_MIN: 0.42,
   TRAILING: 0.90,
   USCITA: 0.40,
   USCITA_MIN_S: 60,
-  PREZZO_MIN_FILL: 0.25,
-  RESTA_MIN: 3,            // il prezzo deve restare >= 3 tick per contare il fill
+  RESTA_MIN: 3,
   MAX_ROUNDS: 10,
   POLL_MS: 1000,
   FILTRO_ON: true,
@@ -69,24 +69,15 @@ async function jget(url) {
 }
 const roundStart = (now = Date.now()) => Math.floor(now / 1000 / WINDOW) * WINDOW;
 
-// ─── PORTAFOGLIO: una sola fonte di verità ─────────────────────────────────
-const PF = {
-  contante: CFG.CAPITALE,
-  aperte: [],               // posizioni non ancora chiuse: {lato,prezzo,shares,costo,slug}
-  pnlRound: [],             // PNL di ogni round chiuso
-  roundGiocati: 0, roundSaltati: 0,
-  feeTotali: 0,
-};
-
+const PF = { contante: CFG.CAPITALE, aperte: [], pnlRound: [], roundGiocati: 0, roundSaltati: 0 };
 const investito = () => r4(PF.aperte.reduce((s, p) => s + p.costo, 0));
 const saldoTotale = () => r4(PF.contante + investito());
 
-// apre una posizione: esce contante, entra in `aperte`. Ritorna la posizione.
 function apri(lato, prezzo, shares, slug, t, ordini, tipo) {
   const costo = r4(prezzo * shares);
   if (costo > PF.contante + 1e-9) {
     ordini.push({ slug, t, lato, tipo: "RIFIUTATO", prezzo, shares, costo, nota: "contante insufficiente" });
-    log(`    ✋ ${tipo} ${lato} RIFIUTATO: serve ${costo} $ ma contante ${r2(PF.contante)} $`);
+    log(`    ✋ ${tipo} ${lato} RIFIUTATO (serve ${costo} $, contante ${r2(PF.contante)} $)`);
     return null;
   }
   PF.contante = r4(PF.contante - costo);
@@ -97,23 +88,19 @@ function apri(lato, prezzo, shares, slug, t, ordini, tipo) {
   return pos;
 }
 
-// chiude una posizione: incassa `valore` per share, toglie il costo. UNA volta.
 function chiudi(pos, prezzoUscita, tipo, t, ordini, feeRate = 0) {
   const idx = PF.aperte.indexOf(pos);
-  if (idx === -1) return null;                       // già chiusa: niente doppioni
+  if (idx === -1) return null;
   PF.aperte.splice(idx, 1);
   const incasso = r4(prezzoUscita * pos.shares);
   const fee = feeRate ? r4(feeRate * prezzoUscita * (1 - prezzoUscita) * pos.shares) : 0;
   PF.contante = r4(PF.contante + incasso - fee);
-  PF.feeTotali = r4(PF.feeTotali + fee);
   const pnl = r4(incasso - fee - pos.costo);
   ordini.push({ slug: pos.slug, t, lato: pos.lato, tipo, prezzo: prezzoUscita, shares: pos.shares,
                 costo: pos.costo, nota: `incasso ${incasso} pnl ${pnl}` });
-  log(`    ← ${tipo} ${pos.lato} a ${prezzoUscita} = ${incasso} $ (pnl ${pnl >= 0 ? "+" : ""}${pnl}) | contante ${r2(PF.contante)} $`);
+  log(`    ← ${tipo} ${pos.lato} a ${prezzoUscita} = ${incasso} $ (pnl ${pnl >= 0 ? "+" : ""}${pnl})`);
   return pnl;
 }
-
-function feeSuFill() { return 0; }
 
 async function trovaRound(startTs) {
   const slug = `btc-updown-5m-${startTs}`;
@@ -130,6 +117,33 @@ async function trovaRound(startTs) {
   } catch (e) { log("[warn] gamma:", e.message); return null; }
 }
 
+// ─── ESITO VERO DAL MERCATO ────────────────────────────────────────────────
+// outcomePrices e' l'array dei prezzi finali: il vincitore ha "1".
+// Il primo outcome di questi mercati e' "Up", il secondo "Down".
+async function esitoVero(slug) {
+  for (let tentativo = 1; tentativo <= 3; tentativo++) {
+    try {
+      const ev = await jget(`${GAMMA}/events?slug=${slug}`);
+      const m = ev?.[0]?.markets?.[0];
+      if (!m) { await sleep(2000); continue; }
+      let prices = m.outcomePrices;
+      if (typeof prices === "string") prices = JSON.parse(prices);
+      let outcomes = m.outcomes;
+      if (typeof outcomes === "string") outcomes = JSON.parse(outcomes);
+      if (!Array.isArray(prices) || prices.length < 2) { await sleep(2000); continue; }
+      const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
+      // non ancora risolto: entrambi lontani da 1
+      if (Math.max(p0, p1) < 0.99) { await sleep(2500); continue; }
+      const nome0 = (outcomes?.[0] ?? "Up").toString().toLowerCase();
+      const nome1 = (outcomes?.[1] ?? "Down").toString().toLowerCase();
+      const vincitoreNome = p0 >= p1 ? nome0 : nome1;
+      const lato = vincitoreNome.startsWith("up") ? "up" : "dn";
+      return { lato, prices: [p0, p1], outcomes: [nome0, nome1], fonte: "gamma" };
+    } catch (e) { await sleep(2000); }
+  }
+  return null;
+}
+
 class BookReader {
   constructor(tokens) {
     this.tokens = tokens; this.books = new Map(); this.ws = null;
@@ -140,7 +154,7 @@ class BookReader {
     if (this.chiuso) return;
     if (this.ws) { try { this.ws.removeAllListeners(); this.ws.terminate(); } catch (_) {} this.ws = null; }
     clearInterval(this.pingTimer); clearTimeout(this.reconnectTimer); clearTimeout(this.openTimer);
-    try { this.ws = new WebSocket(CFG.WS_URL); } catch (e) { log("[ws] err:", e.message); this._riprova(); return; }
+    try { this.ws = new WebSocket(CFG.WS_URL); } catch (e) { this._riprova(); return; }
     this.openTimer = setTimeout(() => { if (this.ws && this.ws.readyState !== 1) this._riprova(); }, CFG.WS_OPEN_TIMEOUT_MS);
     this.ws.on("open", () => {
       clearTimeout(this.openTimer);
@@ -163,19 +177,14 @@ class BookReader {
         }
       } catch (_) {}
     });
-    this.ws.on("close", () => {
-      clearInterval(this.pingTimer); clearTimeout(this.openTimer); this.wsCaduto++;
-      if (this.chiuso) return;
-      log(`[ws] chiuso (#${this.wsCaduto}), riconnessione`);
-      this._riprova();
-    });
+    this.ws.on("close", () => { clearInterval(this.pingTimer); clearTimeout(this.openTimer); this.wsCaduto++;
+      if (!this.chiuso) { log(`[ws] chiuso (#${this.wsCaduto})`); this._riprova(); } });
     this.ws.on("error", () => {});
   }
   _riprova() { if (this.chiuso) return; clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(() => this.start(), CFG.WS_RECONNECT_MS); }
   stop() { this.chiuso = true; clearInterval(this.pingTimer); clearTimeout(this.reconnectTimer);
     clearTimeout(this.openTimer); try { this.ws?.removeAllListeners(); this.ws?.terminate(); } catch (_) {} }
-
   async leggi(tokenId) {
     if (!tokenId) return null;
     let b = this.books.get(tokenId);
@@ -196,15 +205,14 @@ class BookReader {
   }
 }
 
-// fill "onesto": il prezzo deve RESTARE per RESTA_MIN tick consecutivi
 function fillOnesto(storico, lato, quota, shares) {
   for (let k = 0; k < storico.length; k++) {
     const x = storico[k][lato];
-    if (!x || x.ask === null || x.ask > quota || x.size < shares) continue;
+    if (!x || x.ask === null || x.ask > quota || x.ask < CFG.PREZZO_MIN_FILL || x.size < shares) continue;
     let resta = 0;
     for (let j = k; j < storico.length; j++) {
       const y = storico[j][lato];
-      if (y.ask !== null && y.ask <= quota + 0.005 && y.size >= shares) resta++;
+      if (y.ask !== null && y.ask <= quota + 0.005 && y.ask >= CFG.PREZZO_MIN_FILL && y.size >= shares) resta++;
       else break;
     }
     if (resta >= CFG.RESTA_MIN) return { i: k, prezzo: x.ask, resta };
@@ -225,20 +233,13 @@ function salvaCsv(nome, intestazione, righe) {
 async function eseguiRound(r) {
   log(`\n${"=".repeat(70)}`);
   log(`ROUND ${r.slug} | ${r.title} | fee ${(r.feeRate * 10000).toFixed(0)} bps`);
-  log(`    saldo prima: ${saldoTotale()} $ (contante ${r2(PF.contante)} + investito ${investito()})`);
 
   const saldoPrima = saldoTotale();
-  const contantePrima = PF.contante;
-  const apertePrima = PF.aperte.length;
-
   const reader = new BookReader([r.upToken, r.dnToken].filter(Boolean));
   reader.start();
 
   const inizio = roundStart();
-  const storico = [];
-  const ordini = [];
-  const tick = [];
-  const mie = [];                                    // posizioni di QUESTO round
+  const storico = [], ordini = [], tick = [], mie = [];
   let agg = null, decisione = null, avviso = false;
   let filtroPassato = !CFG.FILTRO_ON ? true : null, sommaInizio = null;
   let tUp = null, tDn = null, minUp = 9, minDn = 9;
@@ -248,11 +249,10 @@ async function eseguiRound(r) {
     const [up, dn] = await Promise.all([reader.leggi(r.upToken), reader.leggi(r.dnToken)]);
     if (!up || !dn) { await sleep(CFG.POLL_MS); continue; }
 
-    const punto = { t: +t.toFixed(1),
+    storico.push({ t: +t.toFixed(1),
       up: { ask: up.bestAsk, size: up.askSize, bid: up.bestBid },
-      dn: { ask: dn.bestAsk, size: dn.askSize, bid: dn.bestBid } };
-    storico.push(punto);
-    tick.push({ t: punto.t, up: up.bestAsk, dn: dn.bestAsk, askUp: up.askSize, askDn: dn.askSize, bidUp: up.bestBid, bidDn: dn.bestBid });
+      dn: { ask: dn.bestAsk, size: dn.askSize, bid: dn.bestBid } });
+    tick.push({ t: +t.toFixed(1), up: up.bestAsk, dn: dn.bestAsk, askUp: up.askSize, askDn: dn.askSize, bidUp: up.bestBid, bidDn: dn.bestBid });
     if (up.bestAsk) minUp = Math.min(minUp, up.bestAsk);
     if (dn.bestAsk) minDn = Math.min(minDn, dn.bestAsk);
 
@@ -267,17 +267,15 @@ async function eseguiRound(r) {
       await sleep(CFG.POLL_MS); continue;
     }
 
-    // ── APERTURA: ogni lato quando il SUO prezzo resta a <= quota
     for (const lato of ["up", "dn"]) {
       if (mie.find((p) => p.lato === lato)) continue;
       const f = fillOnesto(storico, lato, CFG.QUOTA, CFG.SHARES);
       if (f) {
-        const p = apri(lato, f.prezzo, CFG.SHARES, r.slug, punto.t, ordini, "APERTURA");
-        if (p) { mie.push(p); if (lato === "up") tUp = punto.t; else tDn = punto.t; }
+        const p = apri(lato, f.prezzo, CFG.SHARES, r.slug, +t.toFixed(1), ordini, "APERTURA");
+        if (p) { mie.push(p); if (lato === "up") tUp = +t.toFixed(1); else tDn = +t.toFixed(1); }
       }
     }
 
-    // ── AGGIUNTA: solo su UN lato scoperto, dopo AGG_DOPO_S, se il lato e' vivo
     if (mie.length >= 2 && !agg && !avviso) { avviso = true; log(`    ⊘ coppia completa → nessuna aggiunta`); }
     if (!agg && mie.length === 1) {
       const p0 = mie[0];
@@ -288,14 +286,13 @@ async function eseguiRound(r) {
         } else if (book.bestAsk !== null && book.bestAsk >= CFG.SOGLIA_AGG && book.bestAsk < 0.97) {
           const prezzoFill = Math.min(book.bestAsk, CFG.SOGLIA_AGG);
           if (book.askSize >= CFG.SHARES_AGG) {
-            const np = apri(p0.lato, prezzoFill, CFG.SHARES_AGG, r.slug, punto.t, ordini, "AGGIUNTA");
-            if (np) { agg = { ...np, pos: np, haToccato: false, chiuso: false }; }
+            const np = apri(p0.lato, prezzoFill, CFG.SHARES_AGG, r.slug, +t.toFixed(1), ordini, "AGGIUNTA");
+            if (np) agg = { ...np, pos: np, haToccato: false, chiuso: false };
           }
         }
       }
     }
 
-    // ── TRAILING sull'aggiunta
     if (agg && !agg.chiuso) {
       const book = agg.lato === "up" ? up : dn;
       const bid = book.bestBid;
@@ -303,20 +300,18 @@ async function eseguiRound(r) {
         if (!agg.haToccato && bid >= CFG.TRAILING) { agg.haToccato = true; log(`    ↑ ${agg.lato} tocca ${CFG.TRAILING}`); }
         else if (agg.haToccato && bid <= CFG.TRAILING) {
           agg.chiuso = true;
-          chiudi(agg.pos, bid, "TRAILING", punto.t, ordini, r.feeRate);
+          chiudi(agg.pos, bid, "TRAILING", +t.toFixed(1), ordini, r.feeRate);
           mie.splice(mie.indexOf(agg.pos), 1);
         }
       }
     }
 
-    // ── USCITA sul lato perdente (solo se ho un lato solo, senza aggiunta)
     if (!decisione && !agg && mie.length === 1) {
       const p = mie[0];
       const book = p.lato === "up" ? up : dn;
       if (book.bestBid !== null && (t - p.t) >= CFG.USCITA_MIN_S && book.bestBid <= CFG.USCITA) {
-        chiudi(p, book.bestBid, "USCITA", punto.t, ordini, r.feeRate);
-        mie.splice(0, 1);
-        decisione = "USCITA";
+        chiudi(p, book.bestBid, "USCITA", +t.toFixed(1), ordini, r.feeRate);
+        mie.splice(0, 1); decisione = "USCITA";
       }
     }
     if (!decisione && mie.length >= 2) decisione = "COPPIA";
@@ -325,15 +320,30 @@ async function eseguiRound(r) {
   }
   reader.stop();
 
-  // ── SCADENZA: liquida TUTTO quello che resta in mano (vince=1.00, perde=0)
+  // ── ESITO: prima dedotto dai tick (per confronto), poi LETTO da Gamma
   const ultimo = tick[tick.length - 1] || {};
   const finUp = ultimo.up ?? 0, finDn = ultimo.dn ?? 0;
-  for (const p of [...mie]) {
-    const vince = p.lato === "up" ? finUp > finDn : finDn > finUp;
-    chiudi(p, vince ? 1.0 : 0.0, "SCADENZA", 300, ordini, 0);
+  const esitoDedotto = finUp > finDn ? "up" : "dn";
+
+  log(`    esito dedotto dai tick: ${esitoDedotto} (up ${finUp} / dn ${finDn}) — ora leggo il vero...`);
+  const vero = await esitoVero(r.slug);
+  const LATO_VINCENTE = vero ? vero.lato : esitoDedotto;
+  const fonte = vero ? "gamma" : "dedotto";
+  if (vero) {
+    log(`    ✔ ESITO VERO: ${vero.lato} (outcomePrices ${vero.prices.join("/")}, outcomes ${vero.outcomes.join("/")})`);
+    if (vero.lato !== esitoDedotto) log(`    ⚠️ i tick dicevano ${esitoDedotto} → la deduzione era SBAGLIATA`);
+  } else {
+    log(`    ⚠️ esito non letto da Gamma: chiudo le residue al valore osservato (nessuna assunzione)`);
   }
 
-  // ── salvataggi dei tick (semantica pulita: i tick sono sempre i valori del libro)
+  // ── liquidazione delle posizioni residue
+  for (const p of [...mie]) {
+    let prezzo;
+    if (vero) prezzo = (p.lato === LATO_VINCENTE) ? 1.0 : 0.0;
+    else prezzo = p.lato === "up" ? Math.min(finUp, 0.99) : Math.min(finDn, 0.99);  // valore osservato
+    chiudi(p, prezzo, vero ? "SCADENZA_ESITO" : "SCADENZA_VALORE_OSSERVATO", 300, ordini, vero ? 0 : r.feeRate);
+  }
+
   try {
     fs.mkdirSync(CFG.OUT_DIR, { recursive: true });
     fs.writeFileSync(path.join(CFG.OUT_DIR, `${r.slug}.csv`),
@@ -350,17 +360,17 @@ async function eseguiRound(r) {
   salvaCsv("ordini.csv", "slug,t,lato,tipo,prezzo,shares,costo,nota",
     ordini.map((o) => [o.slug, o.t ?? "", o.lato, o.tipo, o.prezzo ?? "", o.shares ?? "", o.costo ?? "", o.nota ?? ""].join(",")));
   salvaCsv("portfolio.csv",
-    "slug,contratto,saldo_prima,saldo_dopo,pnl_round,contante_dopo,investito_dopo,esito,coppia,aggiunta,trailing,uscita,saltato,note",
-    [[r.slug, "xreal-v3", r2(saldoPrima), r2(saldoDopo), pnlRound, r2(PF.contante), investito(),
-      decisione ?? (saltato ? "SALTATO" : "FINE"), mie.length >= 2 ? "si" : "no", agg ? "si" : "no",
+    "slug,saldo_prima,saldo_dopo,pnl_round,contante_dopo,investito_dopo,esito,fonte_esito,coppia,aggiunta,trailing,uscita,saltato,note",
+    [[r.slug, r2(saldoPrima), r2(saldoDopo), pnlRound, r2(PF.contante), investito(),
+      decisione ?? (saltato ? "SALTATO" : "FINE"), fonte, mie.length >= 2 ? "si" : "no", agg ? "si" : "no",
       agg?.chiuso ? "si" : "no", decisione === "USCITA" ? "si" : "no", saltato ? "si" : "no",
       `up ${finUp} dn ${finDn}`].join(",")]);
-  salvaCsv("coppie.csv", "slug,up_min,dn_min,t_up_fill,t_dn_fill,coppia_presa,somma_ask_inizio,esito,motivo",
-    [[r.slug, minUp === 9 ? "" : minUp.toFixed(3), minDn === 9 ? "" : minDn.toFixed(3), tUp ?? "", tDn ?? "",
-      (tUp !== null && tDn !== null) ? "SI" : "NO", sommaInizio ?? "", decisione ?? (saltato ? "SALTATO" : "FINE"),
-      saltato ? "filtro" : (tUp !== null && tDn !== null ? "coppia piena" : "un solo lato")].join(",")]);
+  salvaCsv("esiti.csv", "slug,esito_vero,esito_dedotto_dai_tick,coincidono,fonte,up_min,dn_min,coppia_presa,t_up_fill,t_dn_fill",
+    [[r.slug, vero ? vero.lato : "", esitoDedotto, vero ? (vero.lato === esitoDedotto ? "SI" : "NO") : "", fonte,
+      minUp === 9 ? "" : minUp.toFixed(3), minDn === 9 ? "" : minDn.toFixed(3),
+      (tUp !== null && tDn !== null) ? "SI" : "NO", tUp ?? "", tDn ?? ""].join(",")]);
 
-  log(`>>> ${r.slug} | ${decisione ?? (saltato ? "SALTATO" : "FINE")} | PNL ${pnlRound >= 0 ? "+" : ""}${pnlRound} $ | saldo ${saldoDopo} $`);
+  log(`>>> ${r.slug} | esito ${LATO_VINCENTE} (${fonte}) | PNL ${pnlRound >= 0 ? "+" : ""}${pnlRound} $ | saldo ${saldoDopo} $`);
   return pnlRound;
 }
 
@@ -370,20 +380,15 @@ function riepilogo() {
   const sommaPnl = r4(PF.pnlRound.reduce((s, x) => s + x.pnl, 0));
   const atteso = r4(CFG.CAPITALE + sommaPnl);
   const quadra = Math.abs(atteso - saldoFinale) < 0.02;
-
-  log(`\n═══════════ RIEPILOGO (demo, v3 contabilità corretta) ═══════════`);
-  log(`  capitale iniziale:   ${CFG.CAPITALE} $`);
-  log(`  contante:            ${r2(PF.contante)} $`);
-  log(`  posizioni aperte:    ${invest} $`);
-  log(`  SALDO:               ${saldoFinale} $`);
-  log(`  somma PNL dei round: ${sommaPnl} $  (${PF.roundGiocati} round giocati, ${PF.roundSaltati} saltati)`);
-  log(`  quadratura:          ${quadra ? "OK" : "QUADRATURA FALLITA"} (atteso ${atteso} vs saldo ${saldoFinale})`);
-  log(`═════════════════════════════════════════════════════════════════`);
-
+  log(`\n═══════════ RIEPILOGO (demo, v4 esito da Gamma) ═══════════`);
+  log(`  capitale ${CFG.CAPITALE} $ · contante ${r2(PF.contante)} $ · aperte ${invest} $`);
+  log(`  SALDO ${saldoFinale} $ · somma PNL round ${sommaPnl} $ (${PF.roundGiocati} giocati, ${PF.roundSaltati} saltati)`);
+  log(`  quadratura: ${quadra ? "OK" : "FALLITA"} (atteso ${atteso})`);
+  log(`══════════════════════════════════════════════════════════`);
   try {
     fs.mkdirSync(CFG.OUT_DIR, { recursive: true });
     fs.writeFileSync(path.join(CFG.OUT_DIR, "riepilogo.txt"),
-      `contratto xreal-v3\ncapitale ${CFG.CAPITALE}\ncontante ${r2(PF.contante)}\nposizioni_aperte ${invest}\n` +
+      `contratto xreal-v4-esito-gamma\ncapitale ${CFG.CAPITALE}\ncontante ${r2(PF.contante)}\nposizioni_aperte ${invest}\n` +
       `saldo_finale ${saldoFinale}\nsomma_pnl_round ${sommaPnl}\nround_giocati ${PF.roundGiocati}\n` +
       `round_saltati ${PF.roundSaltati}\nquadratura ${quadra ? "OK" : "FALLITA"}\natteso ${atteso}\n`);
   } catch (_) {}
@@ -391,11 +396,9 @@ function riepilogo() {
 
 async function main() {
   log("═══════════════════════════════════════════════");
-  log("  xreal v3.0 · paper DEMO · contabilità corretta");
+  log("  xreal v4.0 · paper DEMO · esito letto da Gamma");
   log("═══════════════════════════════════════════════");
-  log(`  capitale ${CFG.CAPITALE} $ · ${CFG.SHARES} share · quota ${CFG.QUOTA} · agg ${CFG.SOGLIA_AGG} dopo ${CFG.AGG_DOPO_S}s`);
-  log(`  trailing ${CFG.TRAILING} · uscita ${CFG.USCITA} · fill con permanenza ${CFG.RESTA_MIN} tick`);
-
+  log(`  capitale ${CFG.CAPITALE} $ · ${CFG.SHARES} share · quota ${CFG.QUOTA} (min ${CFG.PREZZO_MIN_FILL})`);
   let fatti = 0, tentativi = 0;
   while (fatti < CFG.MAX_ROUNDS && tentativi < CFG.MAX_ROUNDS * 4) {
     tentativi++;
