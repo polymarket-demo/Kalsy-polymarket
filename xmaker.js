@@ -59,6 +59,7 @@ const WINDOW = 300;
 const GAMMA = "[gamma-api.polymarket.com](https://gamma-api.polymarket.com)";
 const CLOB = "[clob.polymarket.com](https://clob.polymarket.com)";
 
+
 // ─── utilità ───────────────────────────────────────────────────────────────
 const r4 = (x) => Math.round(x * 10000) / 10000;
 const r2 = (x) => Math.round(x * 100) / 100;
