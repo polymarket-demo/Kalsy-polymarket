@@ -6,9 +6,9 @@
 //      a una distanza dal midpoint letta dal book. Poi li LASCIA FERMI.
 //   2. Ripiazza solo se il midpoint si sposta davvero (REQUOTE_TOL = 2 cent),
 //      non a ogni tick: un maker che insegue il mercato non è mai nel book.
-//   3. La size degli ordini è CFG.SIZE (5 share): il minimo premiato dal
-//      mercato viene stampato nel log ma NON usato per dimensionare, altrimenti
-//      con capitale DEMO da 50 $ basta un fill.
+//   3. La size degli ordini è OFFSET_SIZE (5 share di default): il minimo
+//      premiato dal mercato viene stampato nel log ma NON usato per
+//      dimensionare, altrimenti con capitale DEMO da 50 $ basta un fill.
 //   4. Un ordine si considera riempito quando il best ask scende al suo prezzo
 //      o sotto: a quel punto il bot è stato preso come maker.
 //   5. Se dopo il fill il lato perde (bid <= STOP_TENUTO dopo STOP_DOPO_S),
@@ -56,8 +56,7 @@ const CFG = {
   OUT_DIR: process.env.OUT_DIR || "out-mk",
 };
 const WINDOW = 300;
-const INDIRIZZO_GAMMA = "[gamma-api.polymarket.com](https://gamma-api.polymarket.com)";
-const INDIRIZZO_CLOB = "[clob.polymarket.com](https://clob.polymarket.com)";
+
 // ─── utilità ───────────────────────────────────────────────────────────────
 const r4 = (x) => Math.round(x * 10000) / 10000;
 const r2 = (x) => Math.round(x * 100) / 100;
@@ -81,6 +80,14 @@ async function jget(url) {
   return r.json();
 }
 const parse = (v) => (typeof v === "string" ? JSON.parse(v) : v);
+
+// Gli indirizzi NON stanno nel file: si compongono da pezzi, così incollare
+// da telefono non può rovinarli (un indirizzo con dentro "[...](...)" spacca fetch).
+const H = "ht" + "tp" + "s:/" + "/";
+const D = "gamma-api.polymarket.com";
+const E = "clob.polymarket.com";
+const g = (q) => H + D + "/events?slug=" + q;
+const pentola = (q) => H + E + "/book?token_id=" + q;
 
 // ─── portafoglio ───────────────────────────────────────────────────────────
 const PF = { contante: CFG.CAPITALE, posizioni: [] };
@@ -109,7 +116,7 @@ function vendi(p, prezzo, t, azione) {
 // ─── mercato ───────────────────────────────────────────────────────────────
 async function trovaRound(start) {
   const slug = `btc-updown-5m-${start}`;
-  const ev = await jget(`${INDIRIZZO_GAMMA}/events?slug=${slug}`);
+  const ev = await jget(g(slug));
   const m = ev?.[0]?.markets?.[0];
   if (!m) return null;
   const tok = parse(m.clobTokenIds);
@@ -125,7 +132,7 @@ async function trovaRound(start) {
 }
 async function book(token) {
   try {
-    const b = await jget(`${INDIRIZZO_CLOB}/book?token_id=${token}`);
+    const b = await jget(pentola(token));
     const lv = (a) => (a || []).map((x) => [parseFloat(x.price), parseFloat(x.size)]).filter((x) => x[1] > 0 && isFinite(x[0]));
     const asks = lv(b.asks).sort((a, c) => a[0] - c[0]);
     const bids = lv(b.bids).sort((a, c) => c[0] - a[0]);
@@ -136,7 +143,7 @@ async function book(token) {
 // ─── esito da Gamma, differito ─────────────────────────────────────────────
 const SOSPESI = [];
 async function esitoGamma(slug) {
-  const ev = await jget(`${INDIRIZZO_GAMMA}/events?slug=${slug}`);
+  const ev = await jget(g(slug));
   const m = ev?.[0]?.markets?.[0];
   if (!m || m.closed !== true) return null;
   const pr = parse(m.outcomePrices).map(Number);
@@ -202,20 +209,21 @@ async function round(r) {
       for (const l of ["up", "dn"]) {
         if (posRound.some((p) => p.lato === l)) continue;      // lato già riempito
         const b = bk[l];
-        const desiderato = Math.max(CFG.PREZZO_MIN,
-          Math.min(CFG.PREZZO_MAX, r4(Math.min(r4(mid[l] - offset), r4(b.ask - 0.01)))));
+        let prezzo = r4(Math.min(r4(mid[l] - offset), r4(b.ask - 0.01)));
+        prezzo = Math.max(CFG.PREZZO_MIN, Math.min(CFG.PREZZO_MAX, prezzo));
         const vecchio = ap[l];
         if (vecchio) {
           // non toccare un ordine appena messo: deve restare nel book
           if (t - vecchio.t < CFG.MIN_RESTING_S) continue;
           // e non toccarlo se il prezzo è rimasto dove lo volevamo
-          if (Math.abs(vecchio.prezzo - desiderato) < CFG.REQUOTE_TOL) continue;
+          const atteso = r4(Math.min(r4(mid[l] - offset), r4(b.ask - 0.01)));
+          if (Math.abs(vecchio.prezzo - Math.max(CFG.PREZZO_MIN, Math.min(CFG.PREZZO_MAX, atteso))) < CFG.REQUOTE_TOL) continue;
           ordine({ slug: r.slug, t, lato: l, azione: "ANNULLA", prezzo: vecchio.prezzo, size: vecchio.size,
                    importo: 0, resting: r4(t - vecchio.t) });
           sResting += r4(t - vecchio.t); nResting++;
         }
-        ap[l] = { prezzo: desiderato, size: CFG.SIZE, t };
-        ordine({ slug: r.slug, t, lato: l, azione: "PIAZZA_LIMITE", prezzo: desiderato, size: CFG.SIZE, importo: 0 });
+        ap[l] = { prezzo, size: CFG.SIZE, t };
+        ordine({ slug: r.slug, t, lato: l, azione: "PIAZZA_LIMITE", prezzo, size: CFG.SIZE, importo: 0 });
       }
 
       // ── fill passivi: il mercato viene a prenderci
