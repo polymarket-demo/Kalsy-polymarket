@@ -23,7 +23,7 @@ jobs:
         env:
           ROUNDS: ${{ github.event.inputs.rounds }}
           DIFESA: ${{ github.event.inputs.difesa }}
-        run: node maker/xmaker.js
+        run: node xmaker.js
       - name: Salva risultati
         if: always()
         uses: actions/upload-artifact@v4
