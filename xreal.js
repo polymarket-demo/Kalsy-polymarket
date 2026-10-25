@@ -9,7 +9,7 @@
 // STRATEGIA (parametri dell'utente, non toccare):
 //   1. ENTRATA: compra entrambi i lati a 0,46 (UP e DN)
 //   2. RICOMPRA: il PRIMO dei due lati che arriva a 0,90 -> +5 share su quel lato
-//   3. USCITA del lato ricomprato: se riscende sotto 0,80 vende;
+//   3. USCITA del lato ricomprato: se riscende sotto 0,70 vende;
 //      se tiene fino alla fine, resta fino alla fine del round
 //   4. USCITA 0,40: il lato perdente esce a 0,40 dopo 60 secondi (sempre attiva)
 //   5. FILTRO: se il round parte sbilanciato (un lato >= 0,70 e l'altro <= 0,30)
@@ -31,11 +31,11 @@ import path from "path";
 
 const CFG = {
   SHARES: 5,
-  QUOTA: 0.46,              // entrambi i lati comprano qui
+  QUOTA: 0.48,              // entrambi i lati comprano qui
   PREZZO_MIN_FILL: 0.05,
   RICOMPRA: 5,              // share della ricompra
   RICOMPRA_A: 0.90,         // il lato tocca qui -> ricompra
-  VENDI_SOTTO: 0.80,        // il lato ricomprato vende se riscende sotto
+  VENDI_SOTTO: 0.70,        // il lato ricomprato vende se riscende sotto
   USCITA: 0.40,             // lato perdente esce qui
   USCITA_MIN_S: 60,
   FILTRO_ALTO: 0.70,        // sbilanciamento: un lato >= a questo
@@ -298,7 +298,7 @@ async function eseguiRound(r) {
 async function main() {
   log("═══════════════════════════════════════════════");
   log("  xreal v6.0 · SOLO FATTI, niente conti");
-  log("  entrambi a 0,46 · ricompra a 0,90 · vende sotto 0,80 · uscita 0,40");
+  log("  entrambi a 0,48 · ricompra a 0,90 · vende sotto 0,70 · uscita 0,40");
   log("═══════════════════════════════════════════════");
   try {
     fs.mkdirSync(CFG.OUT_DIR, { recursive: true });
