@@ -1,0 +1,28 @@
+name: xcoppia 046 momentum
+
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: "Numero di round (max ~60)"
+        default: "30"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Avvia bot
+        env:
+          ROUNDS: ${{ github.event.inputs.rounds }}
+        run: node xcoppia046-momentum.mjs
+      - name: Salva risultati
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: out-cm
+          path: out-cm/
