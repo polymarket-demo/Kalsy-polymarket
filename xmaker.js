@@ -1,8 +1,3 @@
-Ecco il file corretto, incollalo direttamente nella pagina di GitHub. Le parti che ho cambiato sono la size degli ordini (resta 5, il minimo del mercato viene solo stampato) e la tolleranza di ripiazzamento portata a 2 centesimi, con un tempo minimo di 5 secondi in book prima di poter annullare.
-
-javascript
-
-
 // ═══════════════════════════════════════════════════════════════════════════
 // xmaker.js — PAPER TRADING · bot MAKER sulle 5 minuti BTC su/giù di Polymarket
 //
@@ -342,4 +337,4 @@ async function main() {
 }
 process.on("SIGINT", () => { log("\n[interrotto]"); riepilogo(); process.exit(0); });
 process.on("SIGTERM", () => { log("\n[interrotto]"); riepilogo(); process.exit(0); });
-main().catch((e) => { log("[fatale]",
+main().catch((e) => { log("[fatale]", e.stack || e.message); process.exit(1); });
