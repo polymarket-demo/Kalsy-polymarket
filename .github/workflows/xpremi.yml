@@ -1,0 +1,32 @@
+name: xpremi
+
+on:
+  workflow_dispatch:
+    inputs:
+      capitale:
+        description: "Dollari ipotetici per mercato (meta' su YES, meta' su NO)"
+        default: "100"
+      foto:
+        description: "Quante fotografie del book (una ogni 10 minuti)"
+        default: "3"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Scansiona i premi di liquidita' (solo lettura, nessun ordine)
+        env:
+          CAPITALE: ${{ github.event.inputs.capitale }}
+          FOTO: ${{ github.event.inputs.foto }}
+        run: node xpremi.js
+      - name: Salva risultati
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: out-premi
+          path: out-premi/
