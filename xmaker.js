@@ -318,9 +318,13 @@ function riepilogo() {
 
 async function main() {
   log(`══ xmaker v2 · ${CFG.ROUNDS} round · capitale ${CFG.CAPITALE} · size ${CFG.SIZE} · margine ${CFG.MARGINE} · difesa ${CFG.DIFESA ? "attiva" : "spenta"}`);
-  let fatti = 0;
+  let fatti = 0, ultimoStart = null;
   while (fatti < CFG.ROUNDS) {
-    const prossimo = Math.ceil(nowS() / WINDOW) * WINDOW;
+    // se il round precedente e' appena finito, il prossimo e' quello subito dopo
+    // (prima si arrotondava oltre e si saltava un round su due)
+    let prossimo = Math.ceil(nowS() / WINDOW) * WINDOW;
+    if (ultimoStart !== null && nowS() < ultimoStart + WINDOW + 10) prossimo = ultimoStart + WINDOW;
+    ultimoStart = prossimo;
     log(`[attesa] prossimo round alle ${new Date(prossimo * 1000).toISOString().slice(11, 19)} UTC`);
     while (nowS() < prossimo - 0.2) {
       await risolvi();
