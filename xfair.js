@@ -51,7 +51,8 @@ const CFG = {
   VOL_DEFAULT: 7e-5,        // σ per √secondo (≈ 0,12% su 5 minuti)
   VOL_MIN: 2e-5,
   FEED_MAX_RITARDO_S: 5,
-  VARIANTE: (process.env.VARIANTE || "E").toUpperCase(),   // con quale prezzo giusto opera: E o A
+  VARIANTE: (process.env.VARIANTE || "E").toUpperCase(),
+  MAX_DISACCORDO: Number(process.env.MAX_DISACCORDO || 0.15),  // se modello e book differiscono di piu', non compra   // con quale prezzo giusto opera: E o A
   LATENZA_S: Number(process.env.LATENZA_S || 2),     // ritardo stimato del bot (polling 1 s + rete)
   K_SALTO: Number(process.env.K_SALTO || 3),          // edge extra = K_SALTO × salto possibile in LATENZA_S
   ROUNDS: Number(process.env.ROUNDS || 10),
@@ -455,6 +456,8 @@ async function round(r) {
       for (const l of ["up", "dn"]) {
         const b = bk[l];
         if (fineQuote || preso[l] >= CFG.MAX_SHARES || b.ask === null) { annulla(l, t); continue; }
+        // filtro: un disaccordo troppo grande col mercato di solito vuol dire che sbagliamo noi
+        if (b.bid !== null && Math.abs(giusto[l] - (b.bid + b.ask) / 2) > CFG.MAX_DISACCORDO) { annulla(l, t); continue; }
         const edgeEff = CFG.EDGE + CFG.K_SALTO * prezzoGiusto.salto;  // piu' largo se il giusto corre
         let p = Math.floor((giusto[l] - edgeEff) * 100) / 100;       // tick 0,01
         p = Math.min(p, r4(b.ask - 0.01));                             // resta maker
@@ -524,7 +527,7 @@ function riepilogo() {
   const saldo = r4(PF.contante + fermi), atteso = r4(CFG.CAPITALE + pnl);
   const txt = [
     `xfair v3 · opera con la variante ${CFG.VARIANTE} (paper, fill ottimistici)`,
-    `capitale ${CFG.CAPITALE} · size ${CFG.SIZE} · edge ${CFG.EDGE} · max ${CFG.MAX_SHARES}/lato`,
+    `capitale ${CFG.CAPITALE} · size ${CFG.SIZE} · edge ${CFG.EDGE} · max ${CFG.MAX_SHARES}/lato · disaccordo max ${CFG.MAX_DISACCORDO}`,
     `round_risolti ${ok.length} (con fill ${conFill.length}) · non_risolti ${righe.length - ok.length + SOSPESI.length}`,
     `pnl ${pnl} · per round ${ok.length ? r4(pnl / ok.length) : 0} · round in profitto ${conFill.filter((x) => Number(x[7]) > 0).length}/${conFill.length}`,
     "",
@@ -541,7 +544,7 @@ function riepilogo() {
 }
 
 async function main() {
-  log(`══ xfair v3 (price to beat ufficiale) · variante ${CFG.VARIANTE} · ${CFG.ROUNDS} round · edge ${CFG.EDGE} · size ${CFG.SIZE} · max ${CFG.MAX_SHARES}/lato · stop quote ultimi ${CFG.STOP_QUOTE_S}s`);
+  log(`══ xfair v3 (price to beat ufficiale) · variante ${CFG.VARIANTE} · disaccordo max ${CFG.MAX_DISACCORDO} · ${CFG.ROUNDS} round · edge ${CFG.EDGE} · size ${CFG.SIZE} · max ${CFG.MAX_SHARES}/lato · stop quote ultimi ${CFG.STOP_QUOTE_S}s`);
   startFeeds();
   let fatti = 0, ultimoStart = null, tentativi = 0;
   while (fatti < CFG.ROUNDS) {
