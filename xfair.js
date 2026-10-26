@@ -149,9 +149,13 @@ function base() {
   for (const [ts, p] of FEED.tick) {
     if (ts < u[0] - 120) continue;
     const b = BN.alTempo(ts);
-    if (b && ts - b[0] <= 2) d.push(p - b[1]);
+    if (b && ts - b[0] <= 5) d.push(p - b[1]);
   }
-  if (d.length < 20) return null;
+  if (d.length < 5) {
+    // ripiego: ultimo Chainlink contro il Binance piu' vicino nel tempo
+    const b = BN.alTempo(u[0]);
+    return b && u[0] - b[0] <= 10 ? u[1] - b[1] : null;
+  }
   d.sort((a, c) => a - c);
   return d[Math.floor(d.length / 2)];
 }
@@ -180,7 +184,8 @@ function startFeeds() {
       const s = raw.toString();
       let m; try { m = JSON.parse(s); } catch (_) { return; }
       const topic = String(m?.topic || "");
-      if (grezzi < 6 && !visti.has(topic)) { visti.add(topic); grezzi++; log(`[feed] primo messaggio ${topic || "?"}: ${s.slice(0, 300)}`); }
+      const chiave = topic + "|" + (Array.isArray(m?.payload?.data) ? "pacchetto" : "aggiornamento");
+      if (grezzi < 8 && !visti.has(chiave)) { visti.add(chiave); grezzi++; log(`[feed] primo ${chiave}: ${s.slice(0, 300)}`); }
       const p = m?.payload; if (!p) return;
       const feed = topic === "crypto_prices_chainlink" ? FEED : topic === "crypto_prices" ? BN
                  : topic.startsWith("crypto_prices_twap") ? TW : null;
@@ -395,6 +400,8 @@ async function round(r) {
       if (t - ultimoLog >= 60) {
         ultimoLog = t;
         const vv = varianti(r, t);
+        const eta = (f) => { const u = f.ultimo(); return u ? `${f.tick.length} tick, ultimo ${r2(nowS() - u[0])}s fa` : "nessun tick"; };
+        log(`   [${Math.round(t)}s] feed · Chainlink ${eta(FEED)} · Binance ${eta(BN)} · TWAP ${eta(TW)} · differenza CL-Binance ${base() !== null ? r2(base()) : "n/d"}`);
         log(`   [${Math.round(t)}s] giusto A/B/C/D ${vv.A}/${vv.B ?? "-"}/${vv.C ?? "-"}/${vv.D ?? "-"} · CL ${r2(FEED.ultimo()?.[1])} stimato ${r2(clStimato()?.[1] ?? NaN)}`);
         log(`   [${Math.round(t)}s] BTC ${FEED.ultimo()?.[1]} (inizio ${r.prezzoInizio}) σ ${FEED.vol().toExponential(2)} · giusto up ${r4(gUp)} · book up ${up.bid}/${up.ask} dn ${dn.bid}/${dn.ask} · ordini ${ap.up?.prezzo ?? "-"}/${ap.dn?.prezzo ?? "-"} · preso up ${preso.up} dn ${preso.dn}`);
       }
