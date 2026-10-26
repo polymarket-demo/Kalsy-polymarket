@@ -5,10 +5,10 @@ on:
     inputs:
       rounds:
         description: "Numero di round (max ~60)"
-        default: "30"
+        default: "10"
       difesa:
-        description: "Difesa anti fill tossico (1 = sì, 0 = no)"
-        default: "1"
+        description: "Difesa anti fill tossico (1 = si, 0 = no)"
+        default: "0"
 
 jobs:
   run:
@@ -19,11 +19,35 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+
+      - name: Trova lo script
+        id: s
+        run: |
+          F=$(find . -name "xmaker.js" -not -path "./.github/*" | head -1)
+          if [ -z "$F" ]; then echo "nessuno script trovato:"; ls -la; exit 1; fi
+          echo "file=$F" >> $GITHUB_OUTPUT
+
+      - name: Cosa dice Gamma sulle reward
+        run: |
+          S=$(( ( $(date +%s) / 300 ) * 300 ))
+          echo "slug btc-updown-5m-$S"
+          curl -s "[gamma-api.polymarket.com](https://gamma-api.polymarket.com/events?slug=btc-updown-5m-$S)" > gamma.json
+          python3 -c "
+import json
+d=json.load(open('gamma.json'))
+m=d[0]['markets'][0]
+print('campi con reward o fee:')
+for k,v in m.items():
+    if 'reward' in k.lower() or 'fee' in k.lower():
+        print(' ', k, '=', v)
+"
+
       - name: Avvia bot maker
         env:
           ROUNDS: ${{ github.event.inputs.rounds }}
           DIFESA: ${{ github.event.inputs.difesa }}
-        run: node xmaker.js
+        run: node "${{ steps.s.outputs.file }}"
+
       - name: Salva risultati
         if: always()
         uses: actions/upload-artifact@v4
