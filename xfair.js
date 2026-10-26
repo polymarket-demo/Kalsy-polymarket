@@ -37,6 +37,8 @@
 import fs from "fs";
 import path from "path";
 
+// mercato: "5m" (predefinito) oppure "15m"
+const MERCATO = (process.env.MERCATO || "5m").toLowerCase() === "15m" ? "15m" : "5m";
 const CFG = {
   CAPITALE: 50,
   SIZE: Number(process.env.SIZE || 5),
@@ -45,8 +47,8 @@ const CFG = {
   REQUOTE_TOL: 0.01,
   PREZZO_MIN: 0.05,
   PREZZO_MAX: 0.95,
-  STOP_QUOTE_S: Number(process.env.STOP_QUOTE_S || 60), // niente ordini negli ultimi N s
-  TWAP_S: 30,
+  STOP_QUOTE_S: Number(process.env.STOP_QUOTE_S || (MERCATO === "15m" ? 120 : 60)), // niente ordini negli ultimi N s
+  TWAP_S: MERCATO === "15m" ? 60 : 30,   // media di risoluzione: 30 s per i 5 minuti, 60 s per i 15 minuti
   VOL_FINESTRA_S: 600,
   VOL_DEFAULT: 7e-5,        // σ per √secondo (≈ 0,12% su 5 minuti)
   VOL_MIN: 2e-5,
@@ -61,10 +63,10 @@ const CFG = {
   ESITO_DOPO_S: 90,
   ESITO_OGNI_S: 10,
   ESITO_MAX_S: 900,
-  OUT_DIR: process.env.OUT_DIR || "out-fair",
+  OUT_DIR: process.env.OUT_DIR || (MERCATO === "15m" ? "out-fair15" : "out-fair"),
   RTDS: "wss://ws-live-data.polymarket.com",
 };
-const WINDOW = 300;
+const WINDOW = MERCATO === "15m" ? 900 : 300;
 const GAMMA = "https://gamma-api.polymarket.com";
 const CLOB = "https://clob.polymarket.com";
 
@@ -175,7 +177,7 @@ function startFeeds() {
     ws.on("open", () => {
       ws.send(JSON.stringify({ action: "subscribe", subscriptions: [
         { topic: "crypto_prices_chainlink", type: "*", filters: JSON.stringify({ symbol: "btc/usd" }) },
-        { topic: "crypto_prices_twap_thirty", type: "*", filters: JSON.stringify({ symbol: "btc/usd" }) },
+        { topic: MERCATO === "15m" ? "crypto_prices_twap_sixty" : "crypto_prices_twap_thirty", type: "*", filters: JSON.stringify({ symbol: "btc/usd" }) },
       ] }));
       log("[feed] connesso a RTDS: chainlink btc/usd + twap 30s");
       ping = setInterval(() => { try { ws.send("PING"); } catch (_) {} }, 5000);
@@ -293,7 +295,7 @@ function varianti(r, t) {
 let ptbGrezzi = 0;
 async function ptbPolymarket(start) {
   const iso = (s) => new Date(s * 1000).toISOString().replace(".000Z", "Z");
-  const url = `https://polymarket.com/api/crypto/crypto-price?symbol=BTC&eventStartTime=${iso(start)}&variant=fiveminute&endDate=${iso(start + WINDOW)}`;
+  const url = `https://polymarket.com/api/crypto/crypto-price?symbol=BTC&eventStartTime=${iso(start)}&variant=${MERCATO === "15m" ? "fifteenminute" : "fiveminute"}&endDate=${iso(start + WINDOW)}`;
   try {
     const r = await fetch(url, { headers: { accept: "application/json", "user-agent": "Mozilla/5.0" } });
     const testo = await r.text();
@@ -320,7 +322,7 @@ function ordine(o) {
 }
 
 async function trovaRound(start) {
-  const slug = `btc-updown-5m-${start}`;
+  const slug = `btc-updown-${MERCATO}-${start}`;
   const ev = await jget(`${GAMMA}/events?slug=${slug}`);
   const m = ev?.[0]?.markets?.[0];
   if (!m) return null;
@@ -373,14 +375,14 @@ async function risolvi() {
       const inc = p.lato === e.lato ? p.size : 0;
       muovi(p.slug, inc);
       PF.posizioni.splice(PF.posizioni.indexOf(p), 1);
-      ordine({ slug: p.slug, t: 300, lato: p.lato, azione: p.lato === e.lato ? "SCADENZA_VINTA" : "SCADENZA_PERSA", prezzo: inc ? 1 : 0, size: p.size, importo: inc });
+      ordine({ slug: p.slug, t: WINDOW, lato: p.lato, azione: p.lato === e.lato ? "SCADENZA_VINTA" : "SCADENZA_PERSA", prezzo: inc ? 1 : 0, size: p.size, importo: inc });
     }
     const pnl = r4(PF.flussi.get(s.r.slug) || 0);
     const y = e.lato === "up" ? 1 : 0;
     const fine = s.r.start + WINDOW;
     const uff = await ptbPolymarket(s.r.start);
-    const tw30 = TW.alTempo(fine)?.[1] ?? null, clMedia = FEED.media(fine - 30, fine);
-    if (uff) log(`   UFFICIALE ${s.r.slug}: price to beat ${uff.open} · finale ${uff.close} · nostro: inizio CL ${r2(s.r.prezzoInizio ?? NaN)} · TWAP30 a fine ${r2(tw30 ?? NaN)} · media CL 30s ${r2(clMedia ?? NaN)}`);
+    const tw30 = TW.alTempo(fine)?.[1] ?? null, clMedia = FEED.media(fine - CFG.TWAP_S, fine);
+    if (uff) log(`   UFFICIALE ${s.r.slug}: price to beat ${uff.open} · finale ${uff.close} · nostro: inizio CL ${r2(s.r.prezzoInizio ?? NaN)} · TWAP${CFG.TWAP_S} a fine ${r2(tw30 ?? NaN)} · media CL ${CFG.TWAP_S}s ${r2(clMedia ?? NaN)}`);
     const bm = s.campioni.length ? r4(s.campioni.reduce((a, c) => a + (c.giusto - y) ** 2, 0) / s.campioni.length) : "";
     const bk = s.campioni.length ? r4(s.campioni.reduce((a, c) => a + (c.mid - y) ** 2, 0) / s.campioni.length) : "";
     csv("calibrazione.csv", "slug,t,A,B,C,D,E,F,mid_up,esito_up", s.campioni.map((c) => [s.r.slug, c.t, c.v.A ?? "", c.v.B ?? "", c.v.C ?? "", c.v.D ?? "", c.v.E ?? "", c.v.F ?? "", c.mid, y]));
@@ -411,7 +413,7 @@ async function round(r) {
         r.prezzoInizio = p0[1];
         const tw = TW.alTempo(r.start), bn = BN.alTempo(r.start), k = base();
         if (tw && r.start - tw[0] <= 5) r.inizioTwap = tw[1];
-        log(`   prezzo di inizio: Chainlink ${r2(p0[1])} (+${r4(p0[0] - r.start)}s) · TWAP30 ${tw ? r2(tw[1]) + ` (${r4(tw[0] - r.start)}s)` : "n/d"} · Coinbase ${bn ? r2(bn[1]) : "n/d"} · differenza CL-Coinbase ${k !== null ? r2(k) : "n/d"}`);
+        log(`   prezzo di inizio: Chainlink ${r2(p0[1])} (+${r4(p0[0] - r.start)}s) · TWAP${CFG.TWAP_S} ${tw ? r2(tw[1]) + ` (${r4(tw[0] - r.start)}s)` : "n/d"} · Coinbase ${bn ? r2(bn[1]) : "n/d"} · differenza CL-Coinbase ${k !== null ? r2(k) : "n/d"}`);
       }
       else if (t > 10) { log(`   ⚠ nessun prezzo di inizio entro 10 s: round saltato`); break; }
     }
@@ -420,7 +422,7 @@ async function round(r) {
       ptbPolymarket(r.start).then((x) => {
         if (x && x.open && !r.ptb) {
           r.ptb = x.open;   // solo per il registro: NON usato per operare (e' provvisorio)
-          log(`   price to beat PROVVISORIO ${r2(x.open)} (+${Math.round(nowS() - r.start)}s) · nostro Chainlink ${r2(r.prezzoInizio ?? NaN)} (diff ${r2(x.open - (r.prezzoInizio ?? NaN))}) · TWAP30 ${r2(r.inizioTwap ?? NaN)} (diff ${r2(x.open - (r.inizioTwap ?? NaN))})`);
+          log(`   price to beat PROVVISORIO ${r2(x.open)} (+${Math.round(nowS() - r.start)}s) · nostro Chainlink ${r2(r.prezzoInizio ?? NaN)} (diff ${r2(x.open - (r.prezzoInizio ?? NaN))}) · TWAP${CFG.TWAP_S} ${r2(r.inizioTwap ?? NaN)} (diff ${r2(x.open - (r.inizioTwap ?? NaN))})`);
         }
       });
     }
@@ -527,7 +529,7 @@ function riepilogo() {
   const fermi = r4(PF.posizioni.reduce((s, p) => s + p.prezzo * p.size, 0));
   const saldo = r4(PF.contante + fermi), atteso = r4(CFG.CAPITALE + pnl);
   const txt = [
-    `xfair v3.1 · opera con la variante ${CFG.VARIANTE} (paper, fill ottimistici)`,
+    `xfair v3.1 · mercato ${MERCATO} · opera con la variante ${CFG.VARIANTE} (paper, fill ottimistici)`,
     `capitale ${CFG.CAPITALE} · size ${CFG.SIZE} · edge ${CFG.EDGE} · max ${CFG.MAX_SHARES}/lato · disaccordo max ${CFG.MAX_DISACCORDO}`,
     `round_risolti ${ok.length} (con fill ${conFill.length}) · non_risolti ${righe.length - ok.length + SOSPESI.length}`,
     `pnl ${pnl} · per round ${ok.length ? r4(pnl / ok.length) : 0} · round in profitto ${conFill.filter((x) => Number(x[7]) > 0).length}/${conFill.length}`,
@@ -545,7 +547,7 @@ function riepilogo() {
 }
 
 async function main() {
-  log(`══ xfair v3.1 · variante ${CFG.VARIANTE} · disaccordo max ${CFG.MAX_DISACCORDO} · ${CFG.ROUNDS} round · edge ${CFG.EDGE} · size ${CFG.SIZE} · max ${CFG.MAX_SHARES}/lato · stop quote ultimi ${CFG.STOP_QUOTE_S}s`);
+  log(`══ xfair v3.1 · mercato ${MERCATO} · variante ${CFG.VARIANTE} · disaccordo max ${CFG.MAX_DISACCORDO} · ${CFG.ROUNDS} round · edge ${CFG.EDGE} · size ${CFG.SIZE} · max ${CFG.MAX_SHARES}/lato · stop quote ultimi ${CFG.STOP_QUOTE_S}s`);
   startFeeds();
   let fatti = 0, ultimoStart = null, tentativi = 0;
   while (fatti < CFG.ROUNDS) {
