@@ -53,7 +53,7 @@ const CFG = {
   VOL_DEFAULT: 7e-5,        // σ per √secondo (≈ 0,12% su 5 minuti)
   VOL_MIN: 2e-5,
   FEED_MAX_RITARDO_S: 5,
-  VARIANTE: (process.env.VARIANTE || "E").toUpperCase(),
+  VARIANTE: (process.env.VARIANTE || "G").toUpperCase(),
   MAX_DISACCORDO: Number(process.env.MAX_DISACCORDO || 0.15),  // se modello e book differiscono di piu', non compra   // con quale prezzo giusto opera: E o A
   LATENZA_S: Number(process.env.LATENZA_S || 2),     // ritardo stimato del bot (polling 1 s + rete)
   K_SALTO: Number(process.env.K_SALTO || 3),          // edge extra = K_SALTO × salto possibile in LATENZA_S
@@ -273,6 +273,10 @@ function volCoinbase() {
 function prezzoGiusto(r, t) {
   let f = null;
   if (CFG.VARIANTE === "E") f = fairCore(r, t, r.prezzoInizio, clStimato(), volCoinbase() ?? FEED.vol());
+  // variante G (predefinita): partenza = media Chainlink (TWAP) all'inizio del round. Sui round
+  // risolti spiega l'esito ufficiale meglio del tick mostrato sul sito (83/87 contro 78/87;
+  // 8 casi su 8 dove le due regole divergono)
+  if (CFG.VARIANTE === "G" && r.inizioTwap) f = fairCore(r, t, r.inizioTwap, clStimato(), volCoinbase() ?? FEED.vol());
   if (!f) f = fairCore(r, t, r.prezzoInizio, FEED.ultimo());
   prezzoGiusto.salto = f ? f.salto : 0;
   return f ? f.p : null;
@@ -283,12 +287,12 @@ function prezzoGiusto(r, t) {
 //   C: partenza TWAP 30 s   · attuale Chainlink
 //   D: partenza TWAP 30 s   · attuale stimato da Coinbase
 //   E: partenza Chainlink · attuale da Coinbase · volatilita' Coinbase (quella usata)
-//   F: partenza Chainlink · attuale Chainlink · volatilita' Coinbase
+//   F: partenza media (TWAP) · attuale da Coinbase · volatilita' Coinbase (= variante G, quella usata)
 function varianti(r, t) {
   const cl = FEED.ultimo(), st = clStimato();
   const g = (ini, cur, sig) => { const f = fairCore(r, t, ini, cur, sig ?? FEED.vol()); return f ? r4(f.p) : null; };
   return { A: g(r.prezzoInizio, cl), B: g(r.prezzoInizio, st), C: g(r.inizioTwap, cl), D: g(r.inizioTwap, st),
-           E: g(r.prezzoInizio, st, volCoinbase()), F: g(r.prezzoInizio, cl, volCoinbase()) };
+           E: g(r.prezzoInizio, st, volCoinbase()), F: g(r.inizioTwap, st, volCoinbase()) };
 }
 
 // Price to Beat e prezzo finale ufficiali (quelli mostrati sulla pagina del mercato)
@@ -513,7 +517,7 @@ function riepilogo() {
   const COL = { A: 2, B: 3, C: 4, D: 5, E: 6, F: 7 };
   const NOMI = { A: "partenza CL · attuale CL", B: "partenza CL · attuale da Coinbase",
                  C: "partenza TWAP · attuale CL", D: "partenza TWAP · attuale da Coinbase",
-                 E: "partenza CL · Coinbase + vol Coinbase *", F: "partenza CL · attuale CL + vol Coinbase" };
+                 E: "partenza CL · Coinbase + vol Coinbase", F: "partenza MEDIA · Coinbase + vol Coinbase (G) *" };
   const righeBrier = Object.entries(COL).map(([k, i]) => {
     const c = cal.filter((x) => x[i] !== null && x[8] !== null);
     if (!c.length) return `  ${k} ${NOMI[k].padEnd(40)} nessun dato`;
@@ -529,7 +533,7 @@ function riepilogo() {
   const fermi = r4(PF.posizioni.reduce((s, p) => s + p.prezzo * p.size, 0));
   const saldo = r4(PF.contante + fermi), atteso = r4(CFG.CAPITALE + pnl);
   const txt = [
-    `xfair v3.1 · mercato ${MERCATO} · opera con la variante ${CFG.VARIANTE} (paper, fill ottimistici)`,
+    `xfair v3.2 · mercato ${MERCATO} · opera con la variante ${CFG.VARIANTE} (paper, fill ottimistici)`,
     `capitale ${CFG.CAPITALE} · size ${CFG.SIZE} · edge ${CFG.EDGE} · max ${CFG.MAX_SHARES}/lato · disaccordo max ${CFG.MAX_DISACCORDO}`,
     `round_risolti ${ok.length} (con fill ${conFill.length}) · non_risolti ${righe.length - ok.length + SOSPESI.length}`,
     `pnl ${pnl} · per round ${ok.length ? r4(pnl / ok.length) : 0} · round in profitto ${conFill.filter((x) => Number(x[7]) > 0).length}/${conFill.length}`,
@@ -547,7 +551,7 @@ function riepilogo() {
 }
 
 async function main() {
-  log(`══ xfair v3.1 · mercato ${MERCATO} · variante ${CFG.VARIANTE} · disaccordo max ${CFG.MAX_DISACCORDO} · ${CFG.ROUNDS} round · edge ${CFG.EDGE} · size ${CFG.SIZE} · max ${CFG.MAX_SHARES}/lato · stop quote ultimi ${CFG.STOP_QUOTE_S}s`);
+  log(`══ xfair v3.2 · mercato ${MERCATO} · variante ${CFG.VARIANTE} · disaccordo max ${CFG.MAX_DISACCORDO} · ${CFG.ROUNDS} round · edge ${CFG.EDGE} · size ${CFG.SIZE} · max ${CFG.MAX_SHARES}/lato · stop quote ultimi ${CFG.STOP_QUOTE_S}s`);
   startFeeds();
   let fatti = 0, ultimoStart = null, tentativi = 0;
   while (fatti < CFG.ROUNDS) {
