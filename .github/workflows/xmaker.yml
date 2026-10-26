@@ -9,6 +9,9 @@ on:
       difesa:
         description: "Difesa anti fill tossico: 1 = si, 0 = no"
         default: "0"
+      margine:
+        description: "Profitto minimo per share su una coppia (tetto secondo lato = 1 - primo fill - margine)"
+        default: "0.02"
 
 jobs:
   run:
@@ -29,6 +32,7 @@ jobs:
         env:
           ROUNDS: ${{ github.event.inputs.rounds }}
           DIFESA: ${{ github.event.inputs.difesa }}
+          MARGINE: ${{ github.event.inputs.margine }}
         run: node "${{ steps.s.outputs.file }}"
       - name: Salva risultati
         if: always()
