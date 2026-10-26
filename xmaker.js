@@ -1,6 +1,4 @@
-Ecco il workflow da copiare. Aprilo con la matita e sostituisci tutto il contenuto con questo.
 
-yaml
 
 
 name: xmaker
