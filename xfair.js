@@ -51,6 +51,7 @@ const CFG = {
   VOL_DEFAULT: 7e-5,        // σ per √secondo (≈ 0,12% su 5 minuti)
   VOL_MIN: 2e-5,
   FEED_MAX_RITARDO_S: 5,
+  VARIANTE: (process.env.VARIANTE || "E").toUpperCase(),   // con quale prezzo giusto opera: E o A
   LATENZA_S: Number(process.env.LATENZA_S || 2),     // ritardo stimato del bot (polling 1 s + rete)
   K_SALTO: Number(process.env.K_SALTO || 3),          // edge extra = K_SALTO × salto possibile in LATENZA_S
   ROUNDS: Number(process.env.ROUNDS || 10),
@@ -227,9 +228,8 @@ function avviaCoinbase() {
 }
 
 // prezzo giusto di UP, con prezzo di partenza e prezzo attuale scelti
-function fairCore(r, t, inizio, cur) {
+function fairCore(r, t, inizio, cur, sigma = FEED.vol()) {
   if (!cur || !inizio || nowS() - cur[0] > CFG.FEED_MAX_RITARDO_S) return null;
-  const sigma = FEED.vol();
   const tau = Math.max(0, WINDOW - t);
   const W = CFG.TWAP_S;
   let atteso, varianza;
@@ -250,9 +250,26 @@ function fairCore(r, t, inizio, cur) {
   const densita = 0.3989422804014327 * Math.exp(-z * z / 2);
   return { p: Math.min(0.999, Math.max(0.001, phi(z))), salto: Math.min(0.5, densita * dS / Math.sqrt(varianza)) };
 }
-// variante A (quella con cui il bot opera): partenza = primo tick Chainlink, attuale = Chainlink
+// volatilita' misurata su Coinbase, campionata a 1 secondo (Chainlink cambia a scatti
+// e fa sembrare BTC piu' calmo di quanto e')
+function volCoinbase() {
+  const u = BN.ultimo(); if (!u) return null;
+  let s2 = 0, n = 0, prec = null;
+  for (let ts = Math.floor(u[0]) - CFG.VOL_FINESTRA_S; ts <= u[0]; ts++) {
+    const p = BN.alTempo(ts); if (!p) continue;
+    if (prec) { s2 += Math.log(p[1] / prec) ** 2; n++; }
+    prec = p[1];
+  }
+  return n >= 60 ? Math.max(CFG.VOL_MIN, Math.sqrt(s2 / n)) : null;
+}
+// prezzo giusto con cui il bot OPERA
+//   variante E (predefinita): partenza = Price to Beat ufficiale di Polymarket,
+//     attuale = stimato da Coinbase, volatilita' da Coinbase
+//   se il Price to Beat o Coinbase non ci sono, ripiega sulla variante A
 function prezzoGiusto(r, t) {
-  const f = fairCore(r, t, r.prezzoInizio, FEED.ultimo());
+  let f = null;
+  if (CFG.VARIANTE === "E" && r.ptb) f = fairCore(r, t, r.ptb, clStimato(), volCoinbase() ?? FEED.vol());
+  if (!f) f = fairCore(r, t, r.prezzoInizio, FEED.ultimo());
   prezzoGiusto.salto = f ? f.salto : 0;
   return f ? f.p : null;
 }
@@ -261,10 +278,29 @@ function prezzoGiusto(r, t) {
 //   B: partenza Chainlink   · attuale stimato da Coinbase
 //   C: partenza TWAP 30 s   · attuale Chainlink
 //   D: partenza TWAP 30 s   · attuale stimato da Coinbase
+//   E: partenza Price to Beat Polymarket · attuale da Coinbase · volatilita' Coinbase
+//   F: partenza Price to Beat Polymarket · attuale Chainlink
 function varianti(r, t) {
   const cl = FEED.ultimo(), st = clStimato();
-  const g = (ini, cur) => { const f = fairCore(r, t, ini, cur); return f ? r4(f.p) : null; };
-  return { A: g(r.prezzoInizio, cl), B: g(r.prezzoInizio, st), C: g(r.inizioTwap, cl), D: g(r.inizioTwap, st) };
+  const g = (ini, cur, sig) => { const f = fairCore(r, t, ini, cur, sig ?? FEED.vol()); return f ? r4(f.p) : null; };
+  return { A: g(r.prezzoInizio, cl), B: g(r.prezzoInizio, st), C: g(r.inizioTwap, cl), D: g(r.inizioTwap, st),
+           E: g(r.ptb, st, volCoinbase()), F: g(r.ptb, cl) };
+}
+
+// Price to Beat e prezzo finale ufficiali (quelli mostrati sulla pagina del mercato)
+let ptbGrezzi = 0;
+async function ptbPolymarket(start) {
+  const iso = (s) => new Date(s * 1000).toISOString().replace(".000Z", "Z");
+  const url = `https://polymarket.com/api/crypto/crypto-price?symbol=BTC&eventStartTime=${iso(start)}&variant=fiveminute&endDate=${iso(start + WINDOW)}`;
+  try {
+    const r = await fetch(url, { headers: { accept: "application/json", "user-agent": "Mozilla/5.0" } });
+    const testo = await r.text();
+    if (ptbGrezzi < 3) { ptbGrezzi++; log(`   [ptb] risposta ${r.status}: ${testo.slice(0, 200)}`); }
+    if (!r.ok) return null;
+    const j = JSON.parse(testo);
+    const num = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
+    return { open: num(j.openPrice), close: num(j.closePrice), completo: !!j.completed };
+  } catch (e) { if (ptbGrezzi < 3) { ptbGrezzi++; log(`   [ptb] errore: ${e.message}`); } return null; }
 }
 prezzoGiusto.salto = 0;
 
@@ -315,7 +351,7 @@ async function esitoGamma(slug) {
   if (iWin < 0 || pr[1 - iWin] !== 0) return null;
   return { lato: oc[iWin].startsWith("up") ? "up" : "dn", prezzi: pr.join("/") };
 }
-const HEAD_ROUND = "slug,esito,prezzo_inizio,fill_up,fill_dn,costo,edge_medio,pnl,brier_modello,brier_mercato,campioni";
+const HEAD_ROUND = "slug,esito,prezzo_inizio,fill_up,fill_dn,costo,edge_medio,pnl,brier_modello,brier_mercato,campioni,ptb_ufficiale,finale_ufficiale,inizio_twap30,twap30_fine,media_cl30_fine";
 async function risolvi() {
   for (const s of [...SOSPESI]) {
     const eta = nowS() - s.fine;
@@ -326,7 +362,7 @@ async function risolvi() {
     if (!e) {
       if (eta > CFG.ESITO_MAX_S) {
         SOSPESI.splice(SOSPESI.indexOf(s), 1);
-        csv("round.csv", HEAD_ROUND, [[s.r.slug, "NON_RISOLTO", s.r.prezzoInizio ?? "", s.fillUp, s.fillDn, s.costo, s.edgeMedio, "", "", "", ""]]);
+        csv("round.csv", HEAD_ROUND, [[s.r.slug, "NON_RISOLTO", s.r.prezzoInizio ?? "", s.fillUp, s.fillDn, s.costo, s.edgeMedio, "", "", "", "", "", "", "", "", ""]]);
         log(`NON RISOLTO ${s.r.slug} — escluso dal PNL`);
       }
       continue;
@@ -339,11 +375,16 @@ async function risolvi() {
     }
     const pnl = r4(PF.flussi.get(s.r.slug) || 0);
     const y = e.lato === "up" ? 1 : 0;
+    const fine = s.r.start + WINDOW;
+    const uff = await ptbPolymarket(s.r.start);
+    const tw30 = TW.alTempo(fine)?.[1] ?? null, clMedia = FEED.media(fine - 30, fine);
+    if (uff) log(`   UFFICIALE ${s.r.slug}: price to beat ${uff.open} · finale ${uff.close} · nostro: inizio CL ${r2(s.r.prezzoInizio ?? NaN)} · TWAP30 a fine ${r2(tw30 ?? NaN)} · media CL 30s ${r2(clMedia ?? NaN)}`);
     const bm = s.campioni.length ? r4(s.campioni.reduce((a, c) => a + (c.giusto - y) ** 2, 0) / s.campioni.length) : "";
     const bk = s.campioni.length ? r4(s.campioni.reduce((a, c) => a + (c.mid - y) ** 2, 0) / s.campioni.length) : "";
-    csv("calibrazione.csv", "slug,t,A,B,C,D,mid_up,esito_up", s.campioni.map((c) => [s.r.slug, c.t, c.v.A ?? "", c.v.B ?? "", c.v.C ?? "", c.v.D ?? "", c.mid, y]));
+    csv("calibrazione.csv", "slug,t,A,B,C,D,E,F,mid_up,esito_up", s.campioni.map((c) => [s.r.slug, c.t, c.v.A ?? "", c.v.B ?? "", c.v.C ?? "", c.v.D ?? "", c.v.E ?? "", c.v.F ?? "", c.mid, y]));
     SOSPESI.splice(SOSPESI.indexOf(s), 1);
-    csv("round.csv", HEAD_ROUND, [[s.r.slug, e.lato, s.r.prezzoInizio ?? "", s.fillUp, s.fillDn, s.costo, s.edgeMedio, pnl, bm, bk, s.campioni.length]]);
+    csv("round.csv", HEAD_ROUND, [[s.r.slug, e.lato, s.r.prezzoInizio ?? "", s.fillUp, s.fillDn, s.costo, s.edgeMedio, pnl, bm, bk, s.campioni.length,
+      uff?.open ?? "", uff?.close ?? "", s.r.inizioTwap ?? "", tw30 ?? "", clMedia ?? ""]]);
     log(`ESITO ${s.r.slug}: ${e.lato} | fill up ${s.fillUp} dn ${s.fillDn} | PNL ${pnl >= 0 ? "+" : ""}${pnl} | Brier modello ${bm} vs mercato ${bk}`);
   }
 }
@@ -371,6 +412,15 @@ async function round(r) {
         log(`   prezzo di inizio: Chainlink ${r2(p0[1])} (+${r4(p0[0] - r.start)}s) · TWAP30 ${tw ? r2(tw[1]) + ` (${r4(tw[0] - r.start)}s)` : "n/d"} · Coinbase ${bn ? r2(bn[1]) : "n/d"} · differenza CL-Coinbase ${k !== null ? r2(k) : "n/d"}`);
       }
       else if (t > 10) { log(`   ⚠ nessun prezzo di inizio entro 10 s: round saltato`); break; }
+    }
+    if (!r.ptb && t >= 2 && t < 150 && nowS() - (r.ptbUltimo || 0) >= 5) {
+      r.ptbUltimo = nowS();
+      ptbPolymarket(r.start).then((x) => {
+        if (x && x.open && !r.ptb) {
+          r.ptb = x.open;
+          log(`   PRICE TO BEAT Polymarket ${r2(x.open)} (+${Math.round(nowS() - r.start)}s) · nostro Chainlink ${r2(r.prezzoInizio ?? NaN)} (diff ${r2(x.open - (r.prezzoInizio ?? NaN))}) · TWAP30 ${r2(r.inizioTwap ?? NaN)} (diff ${r2(x.open - (r.inizioTwap ?? NaN))})`);
+        }
+      });
     }
     const [up, dn] = await Promise.all([book(r.up), book(r.dn)]);
     const gUp = prezzoGiusto(r, t);
@@ -434,7 +484,7 @@ async function round(r) {
   }
   annulla("up", r4(nowS() - r.start)); annulla("dn", r4(nowS() - r.start));
   fs.writeFileSync(path.join(CFG.OUT_DIR, "tick", `${r.slug}.csv`),
-    "t,giusto_up,up_bid,up_ask,dn_bid,dn_ask,btc_chainlink,chainlink_stimato_da_binance,twap30\n" + tick.map((x) => x.join(",")).join("\n") + "\n");
+    "t,giusto_up,up_bid,up_ask,dn_bid,dn_ask,btc_chainlink,chainlink_stimato_da_coinbase,twap30\n" + tick.map((x) => x.join(",")).join("\n") + "\n");
   const costo = r4(-(PF.flussi.get(r.slug) || 0));
   const edgeMedio = edges.length ? r4(edges.reduce((a, b) => a + b, 0) / edges.length) : "";
   log(`   fine round · preso up ${preso.up} dn ${preso.dn} · speso ${costo} $ · edge medio ai fill ${edgeMedio || "-"} → esito tra ${CFG.ESITO_DOPO_S}s`);
@@ -453,33 +503,34 @@ function riepilogo() {
   const fc = path.join(CFG.OUT_DIR, "calibrazione.csv");
   const cal = fs.existsSync(fc) ? fs.readFileSync(fc, "utf8").trim().split("\n").slice(1)
     .map((l) => l.split(",").map((v, i) => (i === 0 ? v : v === "" ? null : Number(v)))) : [];
-  // colonne: 0 slug, 1 t, 2 A, 3 B, 4 C, 5 D, 6 mid, 7 esito
-  const COL = { A: 2, B: 3, C: 4, D: 5 };
-  const NOMI = { A: "partenza CL · attuale CL (quella usata)", B: "partenza CL · attuale da Coinbase",
-                 C: "partenza TWAP · attuale CL", D: "partenza TWAP · attuale da Coinbase" };
+  // colonne: 0 slug, 1 t, 2 A, 3 B, 4 C, 5 D, 6 E, 7 F, 8 mid, 9 esito
+  const COL = { A: 2, B: 3, C: 4, D: 5, E: 6, F: 7 };
+  const NOMI = { A: "partenza CL · attuale CL", B: "partenza CL · attuale da Coinbase",
+                 C: "partenza TWAP · attuale CL", D: "partenza TWAP · attuale da Coinbase",
+                 E: "partenza UFFICIALE · attuale Coinbase *", F: "partenza UFFICIALE · attuale CL" };
   const righeBrier = Object.entries(COL).map(([k, i]) => {
-    const c = cal.filter((x) => x[i] !== null && x[6] !== null);
+    const c = cal.filter((x) => x[i] !== null && x[8] !== null);
     if (!c.length) return `  ${k} ${NOMI[k].padEnd(40)} nessun dato`;
-    const bm = r4(c.reduce((a, x) => a + (x[i] - x[7]) ** 2, 0) / c.length);
-    const bk = r4(c.reduce((a, x) => a + (x[6] - x[7]) ** 2, 0) / c.length);
+    const bm = r4(c.reduce((a, x) => a + (x[i] - x[9]) ** 2, 0) / c.length);
+    const bk = r4(c.reduce((a, x) => a + (x[8] - x[9]) ** 2, 0) / c.length);
     return `  ${k} ${NOMI[k].padEnd(40)} modello ${bm} vs mercato ${bk} (${c.length} campioni)${bm < bk ? "  ← batte il mercato" : ""}`;
   });
   const fasce = [];
   for (let i = 0; i < 10; i++) {
     const c = cal.filter((x) => x[2] !== null && x[2] >= i / 10 && x[2] < (i + 1) / 10 + (i === 9 ? 1e-9 : 0));
-    if (c.length) fasce.push(`  giusto A ${(i / 10).toFixed(1)}-${((i + 1) / 10).toFixed(1)}: ${String(c.length).padStart(4)} campioni · UP vinto ${r2(100 * c.reduce((a, x) => a + x[7], 0) / c.length)}%`);
+    if (c.length) fasce.push(`  giusto A ${(i / 10).toFixed(1)}-${((i + 1) / 10).toFixed(1)}: ${String(c.length).padStart(4)} campioni · UP vinto ${r2(100 * c.reduce((a, x) => a + x[9], 0) / c.length)}%`);
   }
   const fermi = r4(PF.posizioni.reduce((s, p) => s + p.prezzo * p.size, 0));
   const saldo = r4(PF.contante + fermi), atteso = r4(CFG.CAPITALE + pnl);
   const txt = [
-    "xfair · maker con prezzo giusto da Chainlink (paper, fill ottimistici)",
+    `xfair v3 · opera con la variante ${CFG.VARIANTE} (paper, fill ottimistici)`,
     `capitale ${CFG.CAPITALE} · size ${CFG.SIZE} · edge ${CFG.EDGE} · max ${CFG.MAX_SHARES}/lato`,
     `round_risolti ${ok.length} (con fill ${conFill.length}) · non_risolti ${righe.length - ok.length + SOSPESI.length}`,
     `pnl ${pnl} · per round ${ok.length ? r4(pnl / ok.length) : 0} · round in profitto ${conFill.filter((x) => Number(x[7]) > 0).length}/${conFill.length}`,
     "",
     `CALIBRAZIONE (${cal.length} campioni) — Brier: piu' basso = previsione migliore`,
     ...righeBrier,
-    "  → una variante che non batte il mercato non da' vantaggio",
+    "  → una variante che non batte il mercato non da' vantaggio  (* = quella con cui opera il bot)",
     ...fasce,
     "",
     `contante ${PF.contante} · posizioni aperte al costo ${fermi} · saldo ${saldo} · atteso ${atteso} · quadratura ${Math.abs(atteso - saldo) < 0.005 ? "OK" : "FALLITA"}`,
@@ -490,7 +541,7 @@ function riepilogo() {
 }
 
 async function main() {
-  log(`══ xfair v2 (diagnosi feed) · ${CFG.ROUNDS} round · edge ${CFG.EDGE} · size ${CFG.SIZE} · max ${CFG.MAX_SHARES}/lato · stop quote ultimi ${CFG.STOP_QUOTE_S}s`);
+  log(`══ xfair v3 (price to beat ufficiale) · variante ${CFG.VARIANTE} · ${CFG.ROUNDS} round · edge ${CFG.EDGE} · size ${CFG.SIZE} · max ${CFG.MAX_SHARES}/lato · stop quote ultimi ${CFG.STOP_QUOTE_S}s`);
   startFeeds();
   let fatti = 0, ultimoStart = null, tentativi = 0;
   while (fatti < CFG.ROUNDS) {
