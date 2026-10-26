@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // xfair.js v2 — PAPER TRADING · maker con PREZZO GIUSTO da BTC (Chainlink)
-// v2: registra anche Binance e TWAP 30 s e confronta 4 varianti del prezzo giusto
+// v2: registra anche Coinbase e TWAP 30 s e confronta 4 varianti del prezzo giusto
 //     (la strategia di trading resta la variante A, identica alla v1)
 // Polymarket BTC su/giu' 5 minuti
 //
@@ -99,7 +99,7 @@ function phi(x) {
 
 // ─── FEED PREZZI BTC (RTDS di Polymarket) ──────────────────────────────────
 //   cl = Chainlink spot (quello che usa il bot per operare)
-//   bn = Binance btcusdt (piu' veloce, per misurare il ritardo di Chainlink)
+//   bn = Coinbase BTC-USD (piu' veloce, per misurare il ritardo di Chainlink)
 //   tw = Chainlink TWAP 30 s (per capire qual e' il vero prezzo di partenza)
 class Feed {
   constructor(nome) { this.nome = nome; this.tick = []; }
@@ -141,8 +141,8 @@ const FEED = new Feed("cl");
 const BN = new Feed("bn");
 const TW = new Feed("tw");
 
-// differenza media Chainlink - Binance negli ultimi 2 minuti (le due quotazioni
-// non coincidono: USD contro USDT, aggregato contro singolo exchange)
+// differenza media Chainlink - Coinbase negli ultimi 2 minuti (le due quotazioni
+// non coincidono: aggregato di piu' fonti contro un singolo exchange)
 function base() {
   const u = FEED.ultimo(); if (!u) return null;
   const d = [];
@@ -152,14 +152,14 @@ function base() {
     if (b && ts - b[0] <= 5) d.push(p - b[1]);
   }
   if (d.length < 5) {
-    // ripiego: ultimo Chainlink contro il Binance piu' vicino nel tempo
+    // ripiego: ultimo Chainlink contro il Coinbase piu' vicino nel tempo
     const b = BN.alTempo(u[0]);
     return b && u[0] - b[0] <= 10 ? u[1] - b[1] : null;
   }
   d.sort((a, c) => a - c);
   return d[Math.floor(d.length / 2)];
 }
-// stima di dove sara' Chainlink, usando Binance che arriva prima
+// stima di dove sara' Chainlink, usando Coinbase che arriva prima
 function clStimato() {
   const b = BN.fresco(), k = base();
   return b && k !== null ? [b[0], b[1] + k] : null;
@@ -173,10 +173,9 @@ function startFeeds() {
     ws.on("open", () => {
       ws.send(JSON.stringify({ action: "subscribe", subscriptions: [
         { topic: "crypto_prices_chainlink", type: "*", filters: JSON.stringify({ symbol: "btc/usd" }) },
-        { topic: "crypto_prices", type: "update", filters: "btcusdt" },
         { topic: "crypto_prices_twap_thirty", type: "*", filters: JSON.stringify({ symbol: "btc/usd" }) },
       ] }));
-      log("[feed] connesso a RTDS: chainlink btc/usd + binance btcusdt + twap 30s");
+      log("[feed] connesso a RTDS: chainlink btc/usd + twap 30s");
       ping = setInterval(() => { try { ws.send("PING"); } catch (_) {} }, 5000);
     });
     const visti = new Set();
@@ -201,6 +200,30 @@ function startFeeds() {
     ws.on("error", (e) => log("[feed] errore:", e.message));
   }).catch((e) => log("[feed] modulo ws mancante:", e.message));
   avvia();
+  avviaCoinbase();
+}
+
+// Coinbase BTC-USD: prezzo degli scambi in tempo reale (piu' veloce di Chainlink)
+function avviaCoinbase() {
+  let primo = true, ultimoPush = 0;
+  import("ws").then((m) => {
+    const ws = new m.default("wss://ws-feed.exchange.coinbase.com");
+    ws.on("open", () => {
+      ws.send(JSON.stringify({ type: "subscribe", product_ids: ["BTC-USD"], channels: ["ticker"] }));
+      log("[feed] connesso a Coinbase: ticker BTC-USD");
+    });
+    ws.on("message", (raw) => {
+      let d; try { d = JSON.parse(raw.toString()); } catch (_) { return; }
+      if (primo) { primo = false; log(`[feed] primo messaggio Coinbase: ${raw.toString().slice(0, 200)}`); }
+      if (d.type !== "ticker" || !d.price || !d.time) return;
+      const ts = Date.parse(d.time) / 1000;
+      if (ts - ultimoPush < 0.2) return;          // al massimo 5 prezzi al secondo
+      ultimoPush = ts;
+      BN.push(ts, Number(d.price));
+    });
+    ws.on("close", () => { log("[feed] Coinbase chiuso, riconnessione"); setTimeout(avviaCoinbase, 2000); });
+    ws.on("error", (e) => log("[feed] Coinbase errore:", e.message));
+  }).catch((e) => log("[feed] modulo ws mancante:", e.message));
 }
 
 // prezzo giusto di UP, con prezzo di partenza e prezzo attuale scelti
@@ -235,9 +258,9 @@ function prezzoGiusto(r, t) {
 }
 // tutte e 4 le varianti, per il confronto
 //   A: partenza Chainlink   · attuale Chainlink
-//   B: partenza Chainlink   · attuale stimato da Binance
+//   B: partenza Chainlink   · attuale stimato da Coinbase
 //   C: partenza TWAP 30 s   · attuale Chainlink
-//   D: partenza TWAP 30 s   · attuale stimato da Binance
+//   D: partenza TWAP 30 s   · attuale stimato da Coinbase
 function varianti(r, t) {
   const cl = FEED.ultimo(), st = clStimato();
   const g = (ini, cur) => { const f = fairCore(r, t, ini, cur); return f ? r4(f.p) : null; };
@@ -345,7 +368,7 @@ async function round(r) {
         r.prezzoInizio = p0[1];
         const tw = TW.alTempo(r.start), bn = BN.alTempo(r.start), k = base();
         if (tw && r.start - tw[0] <= 5) r.inizioTwap = tw[1];
-        log(`   prezzo di inizio: Chainlink ${r2(p0[1])} (+${r4(p0[0] - r.start)}s) · TWAP30 ${tw ? r2(tw[1]) + ` (${r4(tw[0] - r.start)}s)` : "n/d"} · Binance ${bn ? r2(bn[1]) : "n/d"} · differenza CL-Binance ${k !== null ? r2(k) : "n/d"}`);
+        log(`   prezzo di inizio: Chainlink ${r2(p0[1])} (+${r4(p0[0] - r.start)}s) · TWAP30 ${tw ? r2(tw[1]) + ` (${r4(tw[0] - r.start)}s)` : "n/d"} · Coinbase ${bn ? r2(bn[1]) : "n/d"} · differenza CL-Coinbase ${k !== null ? r2(k) : "n/d"}`);
       }
       else if (t > 10) { log(`   ⚠ nessun prezzo di inizio entro 10 s: round saltato`); break; }
     }
@@ -401,7 +424,7 @@ async function round(r) {
         ultimoLog = t;
         const vv = varianti(r, t);
         const eta = (f) => { const u = f.ultimo(); return u ? `${f.tick.length} tick, ultimo ${r2(nowS() - u[0])}s fa` : "nessun tick"; };
-        log(`   [${Math.round(t)}s] feed · Chainlink ${eta(FEED)} · Binance ${eta(BN)} · TWAP ${eta(TW)} · differenza CL-Binance ${base() !== null ? r2(base()) : "n/d"}`);
+        log(`   [${Math.round(t)}s] feed · Chainlink ${eta(FEED)} · Coinbase ${eta(BN)} · TWAP ${eta(TW)} · differenza CL-Coinbase ${base() !== null ? r2(base()) : "n/d"}`);
         log(`   [${Math.round(t)}s] giusto A/B/C/D ${vv.A}/${vv.B ?? "-"}/${vv.C ?? "-"}/${vv.D ?? "-"} · CL ${r2(FEED.ultimo()?.[1])} stimato ${r2(clStimato()?.[1] ?? NaN)}`);
         log(`   [${Math.round(t)}s] BTC ${FEED.ultimo()?.[1]} (inizio ${r.prezzoInizio}) σ ${FEED.vol().toExponential(2)} · giusto up ${r4(gUp)} · book up ${up.bid}/${up.ask} dn ${dn.bid}/${dn.ask} · ordini ${ap.up?.prezzo ?? "-"}/${ap.dn?.prezzo ?? "-"} · preso up ${preso.up} dn ${preso.dn}`);
       }
@@ -432,8 +455,8 @@ function riepilogo() {
     .map((l) => l.split(",").map((v, i) => (i === 0 ? v : v === "" ? null : Number(v)))) : [];
   // colonne: 0 slug, 1 t, 2 A, 3 B, 4 C, 5 D, 6 mid, 7 esito
   const COL = { A: 2, B: 3, C: 4, D: 5 };
-  const NOMI = { A: "partenza CL · attuale CL (quella usata)", B: "partenza CL · attuale da Binance",
-                 C: "partenza TWAP · attuale CL", D: "partenza TWAP · attuale da Binance" };
+  const NOMI = { A: "partenza CL · attuale CL (quella usata)", B: "partenza CL · attuale da Coinbase",
+                 C: "partenza TWAP · attuale CL", D: "partenza TWAP · attuale da Coinbase" };
   const righeBrier = Object.entries(COL).map(([k, i]) => {
     const c = cal.filter((x) => x[i] !== null && x[6] !== null);
     if (!c.length) return `  ${k} ${NOMI[k].padEnd(40)} nessun dato`;
