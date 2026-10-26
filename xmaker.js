@@ -185,7 +185,9 @@ async function round(r) {
     ap[l] = null;
   };
 
+  let fermo = false;              // dopo uno STOP il round e' chiuso: niente piu' ordini
   while (nowS() - r.start < WINDOW - 0.5) {
+    if (fermo) { await risolvi(); await sleep(CFG.POLL_MS); continue; }
     const t = r4(nowS() - r.start);
     const [up, dn] = await Promise.all([book(r.up), book(r.dn)]);
     if (up && dn && up.bid !== null && dn.bid !== null && up.ask !== null && dn.ask !== null) {
@@ -245,10 +247,10 @@ async function round(r) {
           stop++;
           posRound.splice(posRound.indexOf(p), 1);
           for (const l of ["up", "dn"]) if (ap[l]) annulla(l, t);   // round chiuso per la difesa
-          fillLati.stop = true;
+          fermo = true;
         }
       }
-      if (fillLati.stop) { await sleep(CFG.POLL_MS); continue; }
+      if (fermo) { await sleep(CFG.POLL_MS); continue; }
 
       if (t - ultimoLog >= CFG.CAMPIONE_S) {
         ultimoLog = t;
@@ -266,7 +268,7 @@ async function round(r) {
     "t,up_ask,up_size,dn_ask,dn_size,up_bid,dn_bid\n" + tick.map((x) => x.join(",")).join("\n") + "\n");
 
   const lati = ["up", "dn"].filter((l) => fillLati[l] !== undefined);
-  const tipo = lati.length === 2 ? "COPPIA" : lati.length === 1 ? "GAMBA_SINGOLA" : "NESSUN_FILL";
+  const tipo = stop > 0 ? "GAMBA_STOPPATA" : lati.length === 2 ? "COPPIA" : lati.length === 1 ? "GAMBA_SINGOLA" : "NESSUN_FILL";
   const costoCoppia = lati.length === 2 ? r4(fillLati.up + fillLati.dn) : "";
   const latiTxt = lati.map((l) => `${l}@${fillLati[l]}`).join("+");
   log(`   fine round · ${tipo} ${latiTxt}${costoCoppia !== "" ? ` (somma ${costoCoppia}, bloccato ${r4(CFG.SIZE * (1 - costoCoppia))} $)` : ""} · stop ${stop} · in book medio ${nResting ? r2(sResting / nResting) : 0}s → esito tra ${CFG.ESITO_DOPO_S}s`);
@@ -303,6 +305,7 @@ function riepilogo() {
     "round_non_risolti " + (righe.length - ok.length + SOSPESI.length),
     riga("COPPIA"),
     riga("GAMBA_SINGOLA"),
+    riga("GAMBA_STOPPATA"),
     riga("NESSUN_FILL"),
     "pnl " + pnl + "  (per round " + r4(pnl / n) + ")",
     "contante " + PF.contante,
