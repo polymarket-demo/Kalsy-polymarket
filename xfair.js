@@ -264,12 +264,13 @@ function volCoinbase() {
   return n >= 60 ? Math.max(CFG.VOL_MIN, Math.sqrt(s2 / n)) : null;
 }
 // prezzo giusto con cui il bot OPERA
-//   variante E (predefinita): partenza = Price to Beat ufficiale di Polymarket,
-//     attuale = stimato da Coinbase, volatilita' da Coinbase
-//   se il Price to Beat o Coinbase non ci sono, ripiega sulla variante A
+//   variante E (predefinita): partenza = primo tick Chainlink del round (verificato: coincide
+//     con il Price to Beat ufficiale FINALE in 20 round su 20; quello letto dall'endpoint nei
+//     primi secondi e' provvisorio e spesso sbagliato), attuale = stimato da Coinbase,
+//     volatilita' da Coinbase. Se Coinbase non c'e', ripiega sulla variante A
 function prezzoGiusto(r, t) {
   let f = null;
-  if (CFG.VARIANTE === "E" && r.ptb) f = fairCore(r, t, r.ptb, clStimato(), volCoinbase() ?? FEED.vol());
+  if (CFG.VARIANTE === "E") f = fairCore(r, t, r.prezzoInizio, clStimato(), volCoinbase() ?? FEED.vol());
   if (!f) f = fairCore(r, t, r.prezzoInizio, FEED.ultimo());
   prezzoGiusto.salto = f ? f.salto : 0;
   return f ? f.p : null;
@@ -279,13 +280,13 @@ function prezzoGiusto(r, t) {
 //   B: partenza Chainlink   · attuale stimato da Coinbase
 //   C: partenza TWAP 30 s   · attuale Chainlink
 //   D: partenza TWAP 30 s   · attuale stimato da Coinbase
-//   E: partenza Price to Beat Polymarket · attuale da Coinbase · volatilita' Coinbase
-//   F: partenza Price to Beat Polymarket · attuale Chainlink
+//   E: partenza Chainlink · attuale da Coinbase · volatilita' Coinbase (quella usata)
+//   F: partenza Chainlink · attuale Chainlink · volatilita' Coinbase
 function varianti(r, t) {
   const cl = FEED.ultimo(), st = clStimato();
   const g = (ini, cur, sig) => { const f = fairCore(r, t, ini, cur, sig ?? FEED.vol()); return f ? r4(f.p) : null; };
   return { A: g(r.prezzoInizio, cl), B: g(r.prezzoInizio, st), C: g(r.inizioTwap, cl), D: g(r.inizioTwap, st),
-           E: g(r.ptb, st, volCoinbase()), F: g(r.ptb, cl) };
+           E: g(r.prezzoInizio, st, volCoinbase()), F: g(r.prezzoInizio, cl, volCoinbase()) };
 }
 
 // Price to Beat e prezzo finale ufficiali (quelli mostrati sulla pagina del mercato)
@@ -418,8 +419,8 @@ async function round(r) {
       r.ptbUltimo = nowS();
       ptbPolymarket(r.start).then((x) => {
         if (x && x.open && !r.ptb) {
-          r.ptb = x.open;
-          log(`   PRICE TO BEAT Polymarket ${r2(x.open)} (+${Math.round(nowS() - r.start)}s) · nostro Chainlink ${r2(r.prezzoInizio ?? NaN)} (diff ${r2(x.open - (r.prezzoInizio ?? NaN))}) · TWAP30 ${r2(r.inizioTwap ?? NaN)} (diff ${r2(x.open - (r.inizioTwap ?? NaN))})`);
+          r.ptb = x.open;   // solo per il registro: NON usato per operare (e' provvisorio)
+          log(`   price to beat PROVVISORIO ${r2(x.open)} (+${Math.round(nowS() - r.start)}s) · nostro Chainlink ${r2(r.prezzoInizio ?? NaN)} (diff ${r2(x.open - (r.prezzoInizio ?? NaN))}) · TWAP30 ${r2(r.inizioTwap ?? NaN)} (diff ${r2(x.open - (r.inizioTwap ?? NaN))})`);
         }
       });
     }
@@ -510,7 +511,7 @@ function riepilogo() {
   const COL = { A: 2, B: 3, C: 4, D: 5, E: 6, F: 7 };
   const NOMI = { A: "partenza CL · attuale CL", B: "partenza CL · attuale da Coinbase",
                  C: "partenza TWAP · attuale CL", D: "partenza TWAP · attuale da Coinbase",
-                 E: "partenza UFFICIALE · attuale Coinbase *", F: "partenza UFFICIALE · attuale CL" };
+                 E: "partenza CL · Coinbase + vol Coinbase *", F: "partenza CL · attuale CL + vol Coinbase" };
   const righeBrier = Object.entries(COL).map(([k, i]) => {
     const c = cal.filter((x) => x[i] !== null && x[8] !== null);
     if (!c.length) return `  ${k} ${NOMI[k].padEnd(40)} nessun dato`;
@@ -526,7 +527,7 @@ function riepilogo() {
   const fermi = r4(PF.posizioni.reduce((s, p) => s + p.prezzo * p.size, 0));
   const saldo = r4(PF.contante + fermi), atteso = r4(CFG.CAPITALE + pnl);
   const txt = [
-    `xfair v3 · opera con la variante ${CFG.VARIANTE} (paper, fill ottimistici)`,
+    `xfair v3.1 · opera con la variante ${CFG.VARIANTE} (paper, fill ottimistici)`,
     `capitale ${CFG.CAPITALE} · size ${CFG.SIZE} · edge ${CFG.EDGE} · max ${CFG.MAX_SHARES}/lato · disaccordo max ${CFG.MAX_DISACCORDO}`,
     `round_risolti ${ok.length} (con fill ${conFill.length}) · non_risolti ${righe.length - ok.length + SOSPESI.length}`,
     `pnl ${pnl} · per round ${ok.length ? r4(pnl / ok.length) : 0} · round in profitto ${conFill.filter((x) => Number(x[7]) > 0).length}/${conFill.length}`,
@@ -544,7 +545,7 @@ function riepilogo() {
 }
 
 async function main() {
-  log(`══ xfair v3 (price to beat ufficiale) · variante ${CFG.VARIANTE} · disaccordo max ${CFG.MAX_DISACCORDO} · ${CFG.ROUNDS} round · edge ${CFG.EDGE} · size ${CFG.SIZE} · max ${CFG.MAX_SHARES}/lato · stop quote ultimi ${CFG.STOP_QUOTE_S}s`);
+  log(`══ xfair v3.1 · variante ${CFG.VARIANTE} · disaccordo max ${CFG.MAX_DISACCORDO} · ${CFG.ROUNDS} round · edge ${CFG.EDGE} · size ${CFG.SIZE} · max ${CFG.MAX_SHARES}/lato · stop quote ultimi ${CFG.STOP_QUOTE_S}s`);
   startFeeds();
   let fatti = 0, ultimoStart = null, tentativi = 0;
   while (fatti < CFG.ROUNDS) {
