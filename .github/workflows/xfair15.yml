@@ -1,0 +1,35 @@
+name: xfair15
+
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: "Numero di round da 15 minuti (max 22: GitHub ferma i job dopo 6 ore)"
+        default: "22"
+      edge:
+        description: "Sconto minimo sul prezzo giusto (0.05 = compra solo 5 centesimi sotto)"
+        default: "0.05"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Installa dipendenze
+        run: npm install ws@8
+      - name: Avvia bot fair value 15 minuti
+        env:
+          MERCATO: "15m"
+          ROUNDS: ${{ github.event.inputs.rounds }}
+          EDGE: ${{ github.event.inputs.edge }}
+        run: node xfair.js
+      - name: Salva risultati
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: out-fair15
+          path: out-fair15/
