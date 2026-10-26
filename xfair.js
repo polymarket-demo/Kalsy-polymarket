@@ -1,5 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// xfair.js — PAPER TRADING · maker con PREZZO GIUSTO da BTC (Chainlink)
+// xfair.js v2 — PAPER TRADING · maker con PREZZO GIUSTO da BTC (Chainlink)
+// v2: registra anche Binance e TWAP 30 s e confronta 4 varianti del prezzo giusto
+//     (la strategia di trading resta la variante A, identica alla v1)
 // Polymarket BTC su/giu' 5 minuti
 //
 // IDEA
@@ -95,9 +97,12 @@ function phi(x) {
   return x >= 0 ? 1 - p : p;
 }
 
-// ─── FEED PREZZO BTC (Chainlink via RTDS di Polymarket) ────────────────────
+// ─── FEED PREZZI BTC (RTDS di Polymarket) ──────────────────────────────────
+//   cl = Chainlink spot (quello che usa il bot per operare)
+//   bn = Binance btcusdt (piu' veloce, per misurare il ritardo di Chainlink)
+//   tw = Chainlink TWAP 30 s (per capire qual e' il vero prezzo di partenza)
 class Feed {
-  constructor() { this.tick = []; this.ws = null; this.grezzi = 0; this.chiuso = false; }
+  constructor(nome) { this.nome = nome; this.tick = []; }
   push(ts, prezzo) {                       // ts in secondi
     if (!isFinite(ts) || !isFinite(prezzo) || prezzo <= 0) return;
     const ultimo = this.tick[this.tick.length - 1];
@@ -107,8 +112,17 @@ class Feed {
     while (this.tick.length && this.tick[0][0] < limite) this.tick.shift();
   }
   ultimo() { return this.tick[this.tick.length - 1] ?? null; }
+  fresco() { const u = this.ultimo(); return u && nowS() - u[0] <= CFG.FEED_MAX_RITARDO_S ? u : null; }
   primoDopo(ts) { return this.tick.find((x) => x[0] >= ts) ?? null; }
-  media(da, a) {                           // media temporale del prezzo tra da e a
+  alTempo(ts) {                             // ultimo tick a ts o prima (ricerca binaria)
+    let lo = 0, hi = this.tick.length - 1, ris = null;
+    while (lo <= hi) {
+      const m = (lo + hi) >> 1;
+      if (this.tick[m][0] <= ts) { ris = this.tick[m]; lo = m + 1; } else hi = m - 1;
+    }
+    return ris;
+  }
+  media(da, a) {
     const pts = this.tick.filter((x) => x[0] >= da && x[0] <= a);
     if (!pts.length) return null;
     return pts.reduce((s, x) => s + x[1], 0) / pts.length;
@@ -122,65 +136,107 @@ class Feed {
     const dt = pts[pts.length - 1][0] - pts[0][0];
     return dt > 0 ? Math.max(CFG.VOL_MIN, Math.sqrt(s2 / dt)) : CFG.VOL_DEFAULT;
   }
-  start() {
-    if (this.chiuso) return;
-    let WS;
-    import("ws").then((m) => {
-      WS = m.default;
-      this.ws = new WS(CFG.RTDS);
-      this.ws.on("open", () => {
-        this.ws.send(JSON.stringify({ action: "subscribe", subscriptions: [
-          { topic: "crypto_prices_chainlink", type: "*", filters: JSON.stringify({ symbol: "btc/usd" }) },
-        ] }));
-        log("[feed] connesso a RTDS, sottoscritto crypto_prices_chainlink btc/usd");
-        this.ping = setInterval(() => { try { this.ws.send("PING"); } catch (_) {} }, 5000);
-      });
-      this.ws.on("message", (raw) => {
-        const s = raw.toString();
-        if (this.grezzi < 3) { this.grezzi++; log(`[feed] messaggio grezzo #${this.grezzi}: ${s.slice(0, 300)}`); }
-        let m; try { m = JSON.parse(s); } catch (_) { return; }
-        const p = m?.payload; if (!p) return;
-        if (p.symbol && String(p.symbol).toLowerCase() !== "btc/usd") return;
-        const conv = (ts) => (ts > 1e12 ? ts / 1000 : ts);
-        if (Array.isArray(p.data)) for (const d of p.data) this.push(conv(Number(d.timestamp)), Number(d.value));
-        else if (p.value !== undefined) this.push(conv(Number(p.timestamp ?? m.timestamp)), Number(p.value));
-      });
-      this.ws.on("close", () => { clearInterval(this.ping); if (!this.chiuso) { log("[feed] chiuso, riconnessione"); setTimeout(() => this.start(), 2000); } });
-      this.ws.on("error", (e) => log("[feed] errore:", e.message));
-    }).catch((e) => log("[feed] modulo ws mancante:", e.message));
-  }
 }
-const FEED = new Feed();
+const FEED = new Feed("cl");
+const BN = new Feed("bn");
+const TW = new Feed("tw");
 
-// prezzo giusto di UP, dato il prezzo di inizio round
-function prezzoGiusto(r, t) {
-  const u = FEED.ultimo();
-  if (!u || nowS() - u[0] > CFG.FEED_MAX_RITARDO_S || !r.prezzoInizio) return null;
+// differenza media Chainlink - Binance negli ultimi 2 minuti (le due quotazioni
+// non coincidono: USD contro USDT, aggregato contro singolo exchange)
+function base() {
+  const u = FEED.ultimo(); if (!u) return null;
+  const d = [];
+  for (const [ts, p] of FEED.tick) {
+    if (ts < u[0] - 120) continue;
+    const b = BN.alTempo(ts);
+    if (b && ts - b[0] <= 2) d.push(p - b[1]);
+  }
+  if (d.length < 20) return null;
+  d.sort((a, c) => a - c);
+  return d[Math.floor(d.length / 2)];
+}
+// stima di dove sara' Chainlink, usando Binance che arriva prima
+function clStimato() {
+  const b = BN.fresco(), k = base();
+  return b && k !== null ? [b[0], b[1] + k] : null;
+}
+
+function startFeeds() {
+  let grezzi = 0;
+  const avvia = () => import("ws").then((m) => {
+    const ws = new m.default(CFG.RTDS);
+    let ping = null;
+    ws.on("open", () => {
+      ws.send(JSON.stringify({ action: "subscribe", subscriptions: [
+        { topic: "crypto_prices_chainlink", type: "*", filters: JSON.stringify({ symbol: "btc/usd" }) },
+        { topic: "crypto_prices", type: "update", filters: "btcusdt" },
+        { topic: "crypto_prices_twap_thirty", type: "*", filters: JSON.stringify({ symbol: "btc/usd" }) },
+      ] }));
+      log("[feed] connesso a RTDS: chainlink btc/usd + binance btcusdt + twap 30s");
+      ping = setInterval(() => { try { ws.send("PING"); } catch (_) {} }, 5000);
+    });
+    const visti = new Set();
+    ws.on("message", (raw) => {
+      const s = raw.toString();
+      let m; try { m = JSON.parse(s); } catch (_) { return; }
+      const topic = String(m?.topic || "");
+      if (grezzi < 6 && !visti.has(topic)) { visti.add(topic); grezzi++; log(`[feed] primo messaggio ${topic || "?"}: ${s.slice(0, 300)}`); }
+      const p = m?.payload; if (!p) return;
+      const feed = topic === "crypto_prices_chainlink" ? FEED : topic === "crypto_prices" ? BN
+                 : topic.startsWith("crypto_prices_twap") ? TW : null;
+      if (!feed) return;
+      const sym = String(p.symbol || "").toLowerCase();
+      if (sym && sym !== "btc/usd" && sym !== "btcusdt" && sym !== "btcusd") return;
+      const conv = (ts) => (ts > 1e12 ? ts / 1000 : ts);
+      const val = (v) => { v = Number(v); return v > 1e12 ? v / 1e18 : v; };   // TWAP legacy in E18
+      if (Array.isArray(p.data)) for (const d of p.data) feed.push(conv(Number(d.timestamp)), val(d.value));
+      else if (p.value !== undefined) feed.push(conv(Number(p.timestamp ?? m.timestamp)), val(p.full_accuracy_value ?? p.value));
+    });
+    ws.on("close", () => { clearInterval(ping); log("[feed] chiuso, riconnessione"); setTimeout(avvia, 2000); });
+    ws.on("error", (e) => log("[feed] errore:", e.message));
+  }).catch((e) => log("[feed] modulo ws mancante:", e.message));
+  avvia();
+}
+
+// prezzo giusto di UP, con prezzo di partenza e prezzo attuale scelti
+function fairCore(r, t, inizio, cur) {
+  if (!cur || !inizio || nowS() - cur[0] > CFG.FEED_MAX_RITARDO_S) return null;
   const sigma = FEED.vol();
-  const tau = Math.max(0, WINDOW - t);           // secondi alla fine
+  const tau = Math.max(0, WINDOW - t);
   const W = CFG.TWAP_S;
   let atteso, varianza;
   if (tau >= W) {
-    // la media degli ultimi W s parte nel futuro: varianza = σ²(τ - W + W/3)
-    atteso = u[1];
-    varianza = sigma ** 2 * (tau - W + W / 3) * u[1] ** 2;
+    atteso = cur[1];
+    varianza = sigma ** 2 * (tau - W + W / 3) * cur[1] ** 2;
   } else {
-    // parte della media e' gia' osservata
     const fatto = W - tau;
-    const mediaFatta = FEED.media(r.start + WINDOW - W, nowS()) ?? u[1];
-    atteso = (mediaFatta * fatto + u[1] * tau) / W;
-    varianza = sigma ** 2 * (tau ** 3) / (3 * W * W) * u[1] ** 2;
+    const mediaFatta = FEED.media(r.start + WINDOW - W, nowS()) ?? cur[1];
+    atteso = (mediaFatta * fatto + cur[1] * tau) / W;
+    varianza = sigma ** 2 * (tau ** 3) / (3 * W * W) * cur[1] ** 2;
   }
-  const diff = atteso - r.prezzoInizio;
-  if (varianza <= 0) return diff >= 0 ? 0.999 : 0.001;
+  const diff = atteso - inizio;
+  if (varianza <= 0) return { p: diff >= 0 ? 0.999 : 0.001, salto: 0 };
   const z = diff / Math.sqrt(varianza);
-  // quanto puo' muoversi il prezzo giusto in LATENZA_S secondi (1 deviazione standard):
-  // serve ad allargare l'edge quando un ordine rischia di restare indietro
   const quotaFutura = tau >= W ? 1 : tau / W;
-  const dS = u[1] * sigma * Math.sqrt(CFG.LATENZA_S) * quotaFutura;
+  const dS = cur[1] * sigma * Math.sqrt(CFG.LATENZA_S) * quotaFutura;
   const densita = 0.3989422804014327 * Math.exp(-z * z / 2);
-  prezzoGiusto.salto = Math.min(0.5, densita * dS / Math.sqrt(varianza));
-  return Math.min(0.999, Math.max(0.001, phi(z)));
+  return { p: Math.min(0.999, Math.max(0.001, phi(z))), salto: Math.min(0.5, densita * dS / Math.sqrt(varianza)) };
+}
+// variante A (quella con cui il bot opera): partenza = primo tick Chainlink, attuale = Chainlink
+function prezzoGiusto(r, t) {
+  const f = fairCore(r, t, r.prezzoInizio, FEED.ultimo());
+  prezzoGiusto.salto = f ? f.salto : 0;
+  return f ? f.p : null;
+}
+// tutte e 4 le varianti, per il confronto
+//   A: partenza Chainlink   · attuale Chainlink
+//   B: partenza Chainlink   · attuale stimato da Binance
+//   C: partenza TWAP 30 s   · attuale Chainlink
+//   D: partenza TWAP 30 s   · attuale stimato da Binance
+function varianti(r, t) {
+  const cl = FEED.ultimo(), st = clStimato();
+  const g = (ini, cur) => { const f = fairCore(r, t, ini, cur); return f ? r4(f.p) : null; };
+  return { A: g(r.prezzoInizio, cl), B: g(r.prezzoInizio, st), C: g(r.inizioTwap, cl), D: g(r.inizioTwap, st) };
 }
 prezzoGiusto.salto = 0;
 
@@ -257,7 +313,7 @@ async function risolvi() {
     const y = e.lato === "up" ? 1 : 0;
     const bm = s.campioni.length ? r4(s.campioni.reduce((a, c) => a + (c.giusto - y) ** 2, 0) / s.campioni.length) : "";
     const bk = s.campioni.length ? r4(s.campioni.reduce((a, c) => a + (c.mid - y) ** 2, 0) / s.campioni.length) : "";
-    csv("calibrazione.csv", "slug,t,giusto_up,mid_up,esito_up", s.campioni.map((c) => [s.r.slug, c.t, c.giusto, c.mid, y]));
+    csv("calibrazione.csv", "slug,t,A,B,C,D,mid_up,esito_up", s.campioni.map((c) => [s.r.slug, c.t, c.v.A ?? "", c.v.B ?? "", c.v.C ?? "", c.v.D ?? "", c.mid, y]));
     SOSPESI.splice(SOSPESI.indexOf(s), 1);
     csv("round.csv", HEAD_ROUND, [[s.r.slug, e.lato, s.r.prezzoInizio ?? "", s.fillUp, s.fillDn, s.costo, s.edgeMedio, pnl, bm, bk, s.campioni.length]]);
     log(`ESITO ${s.r.slug}: ${e.lato} | fill up ${s.fillUp} dn ${s.fillDn} | PNL ${pnl >= 0 ? "+" : ""}${pnl} | Brier modello ${bm} vs mercato ${bk}`);
@@ -280,12 +336,17 @@ async function round(r) {
     const t = r4(nowS() - r.start);
     if (!r.prezzoInizio) {
       const p0 = FEED.primoDopo(r.start);
-      if (p0 && p0[0] - r.start < 10) { r.prezzoInizio = p0[1]; log(`   prezzo di inizio (Chainlink) ${p0[1]} a +${r4(p0[0] - r.start)}s`); }
+      if (p0 && p0[0] - r.start < 10) {
+        r.prezzoInizio = p0[1];
+        const tw = TW.alTempo(r.start), bn = BN.alTempo(r.start), k = base();
+        if (tw && r.start - tw[0] <= 5) r.inizioTwap = tw[1];
+        log(`   prezzo di inizio: Chainlink ${r2(p0[1])} (+${r4(p0[0] - r.start)}s) · TWAP30 ${tw ? r2(tw[1]) + ` (${r4(tw[0] - r.start)}s)` : "n/d"} · Binance ${bn ? r2(bn[1]) : "n/d"} · differenza CL-Binance ${k !== null ? r2(k) : "n/d"}`);
+      }
       else if (t > 10) { log(`   ⚠ nessun prezzo di inizio entro 10 s: round saltato`); break; }
     }
     const [up, dn] = await Promise.all([book(r.up), book(r.dn)]);
     const gUp = prezzoGiusto(r, t);
-    if (up && dn) tick.push([t.toFixed(1), gUp ?? "", up.bid ?? "", up.ask ?? "", dn.bid ?? "", dn.ask ?? "", FEED.ultimo()?.[1] ?? ""]);
+    if (up && dn) tick.push([t.toFixed(1), gUp ?? "", up.bid ?? "", up.ask ?? "", dn.bid ?? "", dn.ask ?? "", FEED.ultimo()?.[1] ?? "", r2(clStimato()?.[1] ?? NaN) || "", TW.ultimo()?.[1] ?? ""]);
 
     if (gUp === null) {
       if (r.prezzoInizio && !avvisoFeed) { log(`   ⚠ feed BTC fermo: cancello gli ordini`); avvisoFeed = true; }
@@ -329,10 +390,12 @@ async function round(r) {
       // 3) campioni per la calibrazione
       if (t - ultimoCampione >= CFG.CAMPIONE_S && up.bid !== null && up.ask !== null) {
         ultimoCampione = t;
-        campioni.push({ t: Math.round(t), giusto: r4(gUp), mid: r4((up.bid + up.ask) / 2) });
+        campioni.push({ t: Math.round(t), giusto: r4(gUp), mid: r4((up.bid + up.ask) / 2), v: varianti(r, t) });
       }
       if (t - ultimoLog >= 60) {
         ultimoLog = t;
+        const vv = varianti(r, t);
+        log(`   [${Math.round(t)}s] giusto A/B/C/D ${vv.A}/${vv.B ?? "-"}/${vv.C ?? "-"}/${vv.D ?? "-"} · CL ${r2(FEED.ultimo()?.[1])} stimato ${r2(clStimato()?.[1] ?? NaN)}`);
         log(`   [${Math.round(t)}s] BTC ${FEED.ultimo()?.[1]} (inizio ${r.prezzoInizio}) σ ${FEED.vol().toExponential(2)} · giusto up ${r4(gUp)} · book up ${up.bid}/${up.ask} dn ${dn.bid}/${dn.ask} · ordini ${ap.up?.prezzo ?? "-"}/${ap.dn?.prezzo ?? "-"} · preso up ${preso.up} dn ${preso.dn}`);
       }
     }
@@ -341,7 +404,7 @@ async function round(r) {
   }
   annulla("up", r4(nowS() - r.start)); annulla("dn", r4(nowS() - r.start));
   fs.writeFileSync(path.join(CFG.OUT_DIR, "tick", `${r.slug}.csv`),
-    "t,giusto_up,up_bid,up_ask,dn_bid,dn_ask,btc\n" + tick.map((x) => x.join(",")).join("\n") + "\n");
+    "t,giusto_up,up_bid,up_ask,dn_bid,dn_ask,btc_chainlink,chainlink_stimato_da_binance,twap30\n" + tick.map((x) => x.join(",")).join("\n") + "\n");
   const costo = r4(-(PF.flussi.get(r.slug) || 0));
   const edgeMedio = edges.length ? r4(edges.reduce((a, b) => a + b, 0) / edges.length) : "";
   log(`   fine round · preso up ${preso.up} dn ${preso.dn} · speso ${costo} $ · edge medio ai fill ${edgeMedio || "-"} → esito tra ${CFG.ESITO_DOPO_S}s`);
@@ -358,12 +421,23 @@ function riepilogo() {
   const conFill = ok.filter((x) => Number(x[3]) + Number(x[4]) > 0);
   const pnl = r4(ok.reduce((s, x) => s + Number(x[7]), 0));
   const fc = path.join(CFG.OUT_DIR, "calibrazione.csv");
-  const cal = fs.existsSync(fc) ? fs.readFileSync(fc, "utf8").trim().split("\n").slice(1).map((l) => l.split(",").map((v, i) => (i ? Number(v) : v))) : [];
-  const brier = (k) => cal.length ? r4(cal.reduce((a, c) => a + (c[k] - c[4]) ** 2, 0) / cal.length) : "-";
+  const cal = fs.existsSync(fc) ? fs.readFileSync(fc, "utf8").trim().split("\n").slice(1)
+    .map((l) => l.split(",").map((v, i) => (i === 0 ? v : v === "" ? null : Number(v)))) : [];
+  // colonne: 0 slug, 1 t, 2 A, 3 B, 4 C, 5 D, 6 mid, 7 esito
+  const COL = { A: 2, B: 3, C: 4, D: 5 };
+  const NOMI = { A: "partenza CL · attuale CL (quella usata)", B: "partenza CL · attuale da Binance",
+                 C: "partenza TWAP · attuale CL", D: "partenza TWAP · attuale da Binance" };
+  const righeBrier = Object.entries(COL).map(([k, i]) => {
+    const c = cal.filter((x) => x[i] !== null && x[6] !== null);
+    if (!c.length) return `  ${k} ${NOMI[k].padEnd(40)} nessun dato`;
+    const bm = r4(c.reduce((a, x) => a + (x[i] - x[7]) ** 2, 0) / c.length);
+    const bk = r4(c.reduce((a, x) => a + (x[6] - x[7]) ** 2, 0) / c.length);
+    return `  ${k} ${NOMI[k].padEnd(40)} modello ${bm} vs mercato ${bk} (${c.length} campioni)${bm < bk ? "  ← batte il mercato" : ""}`;
+  });
   const fasce = [];
   for (let i = 0; i < 10; i++) {
-    const c = cal.filter((x) => x[2] >= i / 10 && x[2] < (i + 1) / 10 + (i === 9 ? 1e-9 : 0));
-    if (c.length) fasce.push(`  giusto ${(i / 10).toFixed(1)}-${((i + 1) / 10).toFixed(1)}: ${String(c.length).padStart(4)} campioni · UP vinto ${r2(100 * c.reduce((a, x) => a + x[4], 0) / c.length)}%`);
+    const c = cal.filter((x) => x[2] !== null && x[2] >= i / 10 && x[2] < (i + 1) / 10 + (i === 9 ? 1e-9 : 0));
+    if (c.length) fasce.push(`  giusto A ${(i / 10).toFixed(1)}-${((i + 1) / 10).toFixed(1)}: ${String(c.length).padStart(4)} campioni · UP vinto ${r2(100 * c.reduce((a, x) => a + x[7], 0) / c.length)}%`);
   }
   const fermi = r4(PF.posizioni.reduce((s, p) => s + p.prezzo * p.size, 0));
   const saldo = r4(PF.contante + fermi), atteso = r4(CFG.CAPITALE + pnl);
@@ -374,8 +448,8 @@ function riepilogo() {
     `pnl ${pnl} · per round ${ok.length ? r4(pnl / ok.length) : 0} · round in profitto ${conFill.filter((x) => Number(x[7]) > 0).length}/${conFill.length}`,
     "",
     `CALIBRAZIONE (${cal.length} campioni) — Brier: piu' basso = previsione migliore`,
-    `  modello ${brier(2)}  vs  mercato ${brier(3)}`,
-    "  → se il modello non e' piu' basso del mercato, non c'e' vantaggio",
+    ...righeBrier,
+    "  → una variante che non batte il mercato non da' vantaggio",
     ...fasce,
     "",
     `contante ${PF.contante} · posizioni aperte al costo ${fermi} · saldo ${saldo} · atteso ${atteso} · quadratura ${Math.abs(atteso - saldo) < 0.005 ? "OK" : "FALLITA"}`,
@@ -386,8 +460,8 @@ function riepilogo() {
 }
 
 async function main() {
-  log(`══ xfair · ${CFG.ROUNDS} round · edge ${CFG.EDGE} · size ${CFG.SIZE} · max ${CFG.MAX_SHARES}/lato · stop quote ultimi ${CFG.STOP_QUOTE_S}s`);
-  FEED.start();
+  log(`══ xfair v2 (diagnosi feed) · ${CFG.ROUNDS} round · edge ${CFG.EDGE} · size ${CFG.SIZE} · max ${CFG.MAX_SHARES}/lato · stop quote ultimi ${CFG.STOP_QUOTE_S}s`);
+  startFeeds();
   let fatti = 0, ultimoStart = null, tentativi = 0;
   while (fatti < CFG.ROUNDS) {
     if (++tentativi > CFG.ROUNDS * 2) { log(`[stop] troppi round saltati (feed BTC o Gamma non disponibili): esco`); break; }
@@ -412,4 +486,4 @@ async function main() {
 process.on("SIGINT", () => { riepilogo(); process.exit(0); });
 process.on("SIGTERM", () => { riepilogo(); process.exit(0); });
 if (!process.env.XFAIR_NO_MAIN) main().catch((e) => { log("[fatale]", e.stack || e.message); process.exit(1); });
-export { CFG, FEED, PF, round, risolvi, riepilogo, SOSPESI, prezzoGiusto, phi };
+export { CFG, FEED, BN, TW, PF, varianti, base, round, risolvi, riepilogo, SOSPESI, prezzoGiusto, phi };
