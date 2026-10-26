@@ -1,9 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// xmaker.js — PAPER TRADING · bot MAKER sulle 5 minuti BTC su/giù di Polymarket
-//
-// Due ordini limite passivi per round (uno per lato), lasciati nel book.
-// Size 5 share. Difesa anti fill tossico attivabile con DIFESA=0/1.
-// Esito letto SOLO da Gamma, differito. Non piazza ordini veri.
+// xmaker.js — bot MAKER paper trading, BTC su/giù 5 minuti Polymarket
 // ═══════════════════════════════════════════════════════════════════════════
 
 import fs from "fs";
@@ -80,8 +76,7 @@ function vendi(p, prezzo, t, azione) {
   const inc = r4(prezzo * p.size);
   muovi(inc);
   PF.posizioni.splice(PF.posizioni.indexOf(p), 1);
-  ordine({ slug: p.slug, t, lato: p.lato, azione, prezzo, size: p.size, importo: inc,
-           resting: r4(t - p.t) });
+  ordine({ slug: p.slug, t, lato: p.lato, azione, prezzo, size: p.size, importo: inc, resting: r4(t - p.t) });
 }
 
 async function trovaRound(start) {
@@ -133,7 +128,7 @@ async function risolvi() {
       if (eta > CFG.ESITO_MAX_S) {
         SOSPESI.splice(SOSPESI.indexOf(s), 1);
         csv("esiti.csv", "slug,esito,prezzi,secondi_dopo_fine", [[s.r.slug, "NON_RISOLTO", errore || "", Math.round(eta)]]);
-        log(`⚠️  ${s.r.slug} NON RISOLTO dopo ${Math.round(eta)} s — fuori dal PNL`);
+        log(`NON RISOLTO ${s.r.slug} dopo ${Math.round(eta)} s`);
       }
       continue;
     }
@@ -145,6 +140,153 @@ async function risolvi() {
     csv("round.csv", "slug,esito,fill_maker,fill_tenuti,stop,size_ordine,resting_medio_s,spread_medio_c,reward_giorno,pnl,secondi_esito",
       [[s.r.slug, e.lato, s.nFill, s.tenuti, s.stop, CFG.SIZE, s.restingMedio, s.spreadMedio, s.r.ratePerDay, pnl, Math.round(eta)]]);
     csv("reward.csv", "slug,t,lato,prezzo_piazzato,size,spread_c,dentro_max_spread,max_spread_c,reward_giorno", s.campioni);
-    log(`✔ ESITO ${s.r.slug}: ${e.lato} (Gamma ${e.prezzi}, +${Math.round(eta)} s) | fill ${s.nFill} · tenuti ${s.tenuti} · stop ${s.stop} | PNL ${pnl} $`);
+    log(`ESITO ${s.r.slug}: ${e.lato} (Gamma ${e.prezzi}, +${Math.round(eta)}s) | fill ${s.nFill} tenuti ${s.tenuti} stop ${s.stop} | PNL ${pnl}`);
   }
 }
+
+async function round(r) {
+  log(`\n══════ ROUND ${r.slug} (${new Date(r.start * 1000).toISOString().slice(11, 19)} UTC)`);
+  log(`   size ${CFG.SIZE} · minSize mercato ${r.minSize} (ignorato) · maxSpread ${r2(r.maxSpread)} · reward/giorno ${r.ratePerDay}`);
+  const saldoPrima = PF.contante;
+  const tick = [];
+  const ap = { up: null, dn: null };
+  const posRound = [];
+  let offset = CFG.OFFSET_INI, nFill = 0, nTenuti = 0, stop = 0;
+  let sSpread = 0, nSpread = 0, sResting = 0, nResting = 0;
+  const campioni = [];
+  let ultimoCampione = -999, ultimaRisoluzione = 0, ultimoLog = -999;
+
+  while (nowS() - r.start < WINDOW - 0.5) {
+    const t = r4(nowS() - r.start);
+    const [up, dn] = await Promise.all([book(r.up), book(r.dn)]);
+    if (up && dn && up.bid !== null && dn.bid !== null && up.ask !== null && dn.ask !== null) {
+      tick.push([t.toFixed(1), up.ask, Math.round(up.askSz), dn.ask, Math.round(dn.askSz), up.bid, dn.bid]);
+      const bk = { up, dn };
+      const mid = { up: r4((up.bid + up.ask) / 2), dn: r4((dn.bid + dn.ask) / 2) };
+
+      for (const l of ["up", "dn"]) {
+        if (posRound.some((p) => p.lato === l)) continue;
+        const b = bk[l];
+        const desiderato = Math.max(CFG.PREZZO_MIN,
+          Math.min(CFG.PREZZO_MAX, r4(Math.min(r4(mid[l] - offset), r4(b.ask - 0.01)))));
+        const vecchio = ap[l];
+        if (vecchio) {
+          if (t - vecchio.t < CFG.MIN_RESTING_S) continue;
+          if (Math.abs(vecchio.prezzo - desiderato) < CFG.REQUOTE_TOL) continue;
+          ordine({ slug: r.slug, t, lato: l, azione: "ANNULLA", prezzo: vecchio.prezzo, size: vecchio.size, importo: 0, resting: r4(t - vecchio.t) });
+          sResting += r4(t - vecchio.t); nResting++;
+        }
+        ap[l] = { prezzo: desiderato, size: CFG.SIZE, t };
+        ordine({ slug: r.slug, t, lato: l, azione: "PIAZZA_LIMITE", prezzo: desiderato, size: CFG.SIZE, importo: 0 });
+      }
+
+      for (const l of ["up", "dn"]) {
+        const o = ap[l], b = bk[l];
+        if (!o) continue;
+        if (b.ask !== null && b.ask <= o.prezzo) {
+          ordine({ slug: r.slug, t, lato: l, azione: "ANNULLA", prezzo: o.prezzo, size: o.size, importo: 0, resting: r4(t - o.t) });
+          sResting += r4(t - o.t); nResting++;
+          if (riempi(r.slug, t, l, o.prezzo, o.size)) { nFill++; posRound.push(PF.posizioni[PF.posizioni.length - 1]); }
+          ap[l] = null;
+        }
+      }
+
+      if (CFG.DIFESA) for (const p of [...posRound]) {
+        const b = bk[p.lato];
+        if (b.bid !== null && t - p.t >= CFG.STOP_DOPO_S && b.bid <= CFG.STOP_TENUTO && b.bidSz >= p.size) {
+          vendi(p, b.bid, t, "STOP");
+          stop++;
+          posRound.splice(posRound.indexOf(p), 1);
+        }
+      }
+      nTenuti = posRound.length;
+
+      if (t - ultimoCampione >= CFG.CAMPIONE_S) {
+        ultimoCampione = t;
+        for (const l of ["up", "dn"]) {
+          const o = ap[l];
+          const sp = o ? r4((mid[l] - o.prezzo) * 100) : "";
+          if (o) { sSpread += sp; nSpread++; }
+          campioni.push([r.slug, t, l, o?.prezzo ?? "", o?.size ?? "", sp,
+                         sp === "" ? "" : (sp <= r4(r.maxSpread * 100) ? "SI" : "NO"), r4(r.maxSpread * 100), r.ratePerDay]);
+        }
+      }
+
+      if (t - ultimoLog >= CFG.CAMPIONE_S) {
+        ultimoLog = t;
+        log(`   [${Math.round(t)}s] mid up ${mid.up}/dn ${mid.dn} · ordini ${ap.up ? r2(ap.up.prezzo) : "-"}/${ap.dn ? r2(ap.dn.prezzo) : "-"} · fill ${nFill} · posizioni ${posRound.length} · contante ${r2(PF.contante)}`);
+      }
+    }
+    if (nowS() - ultimaRisoluzione >= CFG.ESITO_OGNI_S) { ultimaRisoluzione = nowS(); await risolvi(); }
+    await sleep(CFG.POLL_MS);
+  }
+
+  const tFine = r4(nowS() - r.start);
+  for (const l of ["up", "dn"]) if (ap[l]) {
+    ordine({ slug: r.slug, t: tFine, lato: l, azione: "ANNULLA", prezzo: ap[l].prezzo, size: ap[l].size, importo: 0, resting: r4(tFine - ap[l].t) });
+    sResting += r4(tFine - ap[l].t); nResting++;
+  }
+
+  fs.writeFileSync(path.join(CFG.OUT_DIR, "tick", `${r.slug}.csv`),
+    "t,up_ask,up_size,dn_ask,dn_size,up_bid,dn_bid\n" + tick.map((x) => x.join(",")).join("\n") + "\n");
+  const aperti = PF.posizioni.filter((p) => p.slug === r.slug);
+  log(`   fine round · fill ${nFill} · stop ${stop} · in book medio ${nResting ? r2(sResting / nResting) : 0}s · aperte ${aperti.map((p) => `${p.lato}@${p.prezzo}`).join(" ") || "nessuna"} → esito tra ${CFG.ESITO_DOPO_S}s`);
+  SOSPESI.push({ r, fine: r.start + WINDOW, saldoPrima, ultimoTentativo: 0, nFill, nTenuti, stop,
+    restingMedio: nResting ? r4(sResting / nResting) : "", spreadMedio: nSpread ? r4(sSpread / nSpread) : "", campioni });
+}
+
+function riepilogo() {
+  const f = path.join(CFG.OUT_DIR, "round.csv");
+  const righe = fs.existsSync(f) ? fs.readFileSync(f, "utf8").trim().split("\n").slice(1).map((l) => l.split(",")) : [];
+  const ok = righe.filter((x) => x[1] === "up" || x[1] === "dn");
+  const n = ok.length || 1;
+  const pnl = r4(ok.reduce((s, x) => s + Number(x[9]), 0));
+  const fermi = r4(PF.posizioni.reduce((s, p) => s + p.prezzo * p.size, 0));
+  const saldo = r4(PF.contante + fermi);
+  const atteso = r4(CFG.CAPITALE + pnl);
+  const txt = [
+    "bot maker 5m BTC (paper, senza reward vere)",
+    "capitale " + CFG.CAPITALE,
+    "size_ordine " + CFG.SIZE,
+    "round_risolti " + ok.length,
+    "round_non_risolti " + (righe.length - ok.length + SOSPESI.length),
+    "fill_maker " + ok.reduce((s, x) => s + Number(x[2]), 0),
+    "stop_scattati " + ok.reduce((s, x) => s + Number(x[4]), 0),
+    "pnl " + pnl + "  (per round " + r4(pnl / n) + ")",
+    "contante " + PF.contante,
+    "posizioni_aperte_al_costo " + fermi,
+    "saldo " + saldo,
+    "atteso " + atteso,
+    "quadratura " + (Math.abs(atteso - saldo) < 0.005 ? "OK" : "FALLITA"),
+    ""
+  ].join("\n");
+  fs.writeFileSync(path.join(CFG.OUT_DIR, "riepilogo.txt"), txt);
+  log("\n══════ RIEPILOGO\n" + txt);
+}
+
+async function main() {
+  log(`══ xmaker · ${CFG.ROUNDS} round · capitale ${CFG.CAPITALE} · size ${CFG.SIZE} · difesa ${CFG.DIFESA ? "attiva" : "spenta"}`);
+  let fatti = 0;
+  while (fatti < CFG.ROUNDS) {
+    const prossimo = Math.ceil(nowS() / WINDOW) * WINDOW;
+    log(`[attesa] prossimo round alle ${new Date(prossimo * 1000).toISOString().slice(11, 19)} UTC`);
+    while (nowS() < prossimo - 0.2) {
+      await risolvi();
+      await sleep(Math.min(5000, Math.max(200, (prossimo - nowS()) * 1000 - 200)));
+    }
+    let r = null;
+    for (let k = 0; k < 5 && !r; k++) {
+      try { r = await trovaRound(prossimo); } catch (e) { log("[warn] gamma:", e.message); }
+      if (!r) await sleep(1000);
+    }
+    if (!r) { log(`[salto] round ${prossimo} non trovato`); continue; }
+    try { await round(r); fatti++; } catch (e) { log("[err] round:", e.stack || e.message); }
+  }
+  log(`[fine] attendo gli esiti di ${SOSPESI.length} round...`);
+  while (SOSPESI.length) { await risolvi(); await sleep(2000); }
+  riepilogo();
+  process.exit(0);
+}
+process.on("SIGINT", () => { log("\n[interrotto]"); riepilogo(); process.exit(0); });
+process.on("SIGTERM", () => { log("\n[interrotto]"); riepilogo(); process.exit(0); });
+main().catch((e) => { log("[fatale]", e.stack || e.message); process.exit(1); });
