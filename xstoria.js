@@ -54,9 +54,9 @@ async function richiesta(url, opz = {}, tentativi = 4) {
     try {
       const r = await fetch(url, { ...opz, headers: { accept: "application/json", "content-type": "application/json", ...(opz.headers || {}) } });
       if (r.status === 429 || r.status >= 500) throw new Error(`HTTP ${r.status}`);
-      if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
+      if (!r.ok) { const e = new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`); e.definitivo = r.status < 500; throw e; }
       return await r.json();
-    } catch (e) { if (k === tentativi) throw e; await sleep(1500 * k); }
+    } catch (e) { if (e.definitivo || k === tentativi) throw e; await sleep(1500 * k); }
   }
 }
 
@@ -106,6 +106,33 @@ function concorrenza(bY, bN, medio, v) {
   for (const [p, n] of bY.asks) q2 += S(v, c(p - medio)) * n;
   for (const [p, n] of bN.bids) q2 += S(v, c((1 - medio) - p)) * n;
   return qmin(q1, q2, medio);
+}
+
+// ─── storia dei prezzi: un giorno alla volta a 1 minuto ────────────────────
+const GIORNI = { "1d": 1, "1w": 7, "1m": 30 };
+let fedelta = 1;   // minuti; se l'API chiede di piu' la alzo
+async function storia(tok, nome) {
+  const ora = Math.floor(Date.now() / 1000), giorni = GIORNI[CFG.INTERVALLO] || 7;
+  const punti = new Map();
+  for (let d = giorni - 1; d >= 0; d--) {
+    const da = ora - (d + 1) * 86400, a = ora - d * 86400;
+    for (let tentativo = 0; tentativo < 3; tentativo++) {
+      try {
+        const h = await richiesta(`${CFG.CLOB}/prices-history?market=${tok}&startTs=${da}&endTs=${a}&fidelity=${fedelta}`);
+        for (const x of h.history || []) {
+          const t = Number(x.t) > 1e12 ? Number(x.t) / 1000 : Number(x.t), p = Number(x.p);
+          if (isFinite(t) && isFinite(p)) punti.set(t, p);
+        }
+        break;
+      } catch (e) {
+        const min = /minimum 'fidelity'.*? is (\d+)/.exec(e.message);
+        if (min && Number(min[1]) > fedelta) { fedelta = Number(min[1]); log(`[api] l'API chiede fidelity minima ${fedelta} minuti: la uso`); continue; }
+        log(`[warn] storia ${nome}: ${e.message}`); return null;
+      }
+    }
+    await sleep(60);
+  }
+  return [...punti.entries()].sort((x, y) => x[0] - y[0]);
 }
 
 // ─── simulazione su una serie di prezzi ────────────────────────────────────
@@ -175,11 +202,9 @@ async function main() {
   let grezzi = 0;
   for (const c of scelti) {
     const tok = String(c.m.tokens[0].token_id);
-    let h;
-    try { h = await richiesta(`${CFG.CLOB}/prices-history?market=${tok}&interval=${CFG.INTERVALLO}&fidelity=1`); }
-    catch (e) { log(`[warn] storia ${c.m.market_slug}: ${e.message}`); continue; }
-    const serie = (h.history || []).map((x) => [Number(x.t) > 1e12 ? Number(x.t) / 1000 : Number(x.t), Number(x.p)]).filter((x) => isFinite(x[0]) && isFinite(x[1])).sort((a, b) => a[0] - b[0]);
-    if (grezzi < 2) { grezzi++; log(`[api] storia esempio: ${serie.length} punti, primo ${JSON.stringify(serie[0])}, ultimo ${JSON.stringify(serie[serie.length - 1])}`); }
+    const serie = await storia(tok, c.m.market_slug);
+    if (!serie) continue;
+    if (grezzi < 2) { grezzi++; log(`[api] storia esempio: ${serie.length} punti (fidelity ${fedelta} min), primo ${JSON.stringify(serie[0])}, ultimo ${JSON.stringify(serie[serie.length - 1])}`); }
     if (serie.length < 100) continue;
     const s = simula(c.m, serie, c);
     if (s.giorni < 0.5) continue;
@@ -202,7 +227,7 @@ async function main() {
   const sum = (k) => r2(righe.reduce((a, x) => a + x[k], 0));
   const med = (k) => { const a = righe.map((x) => x[k]).sort((p, q) => p - q); return a[Math.floor(a.length / 2)]; };
   const txt = [
-    `xstoria · ${new Date().toISOString().slice(0, 16)} UTC · ${righe.length} mercati simulati · ${CFG.CAPITALE} $ ciascuno · storia ${CFG.INTERVALLO}`,
+    `xstoria · ${new Date().toISOString().slice(0, 16)} UTC · ${righe.length} mercati simulati · ${CFG.CAPITALE} $ ciascuno · storia ${CFG.INTERVALLO} · prezzi ogni ${fedelta} min`,
     "",
     `TOTALE su tutti i mercati simulati: premio ${sum("premio")} $ · perdite/guadagni da esecuzioni ${sum("trading")} $ · NETTO ${sum("netto")} $`,
     `per mercato al giorno (ogni ${CFG.CAPITALE} $): premio ${r4(righe.reduce((a, x) => a + x.premio_giorno, 0) / righe.length)} · esecuzioni ${r4(righe.reduce((a, x) => a + x.trading_giorno, 0) / righe.length)} · netto ${r4(m)}`,
