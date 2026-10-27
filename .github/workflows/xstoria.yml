@@ -1,0 +1,36 @@
+name: xstoria
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidati:
+        description: "Quanti mercati simulare (i migliori per premio stimato)"
+        default: "200"
+      intervallo:
+        description: "Storia dei prezzi: 1d, 1w oppure 1m"
+        default: "1w"
+      capitale:
+        description: "Dollari ipotetici per mercato"
+        default: "100"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Backtest farming premi (solo lettura, nessun ordine)
+        env:
+          CANDIDATI: ${{ github.event.inputs.candidati }}
+          INTERVALLO: ${{ github.event.inputs.intervallo }}
+          CAPITALE: ${{ github.event.inputs.capitale }}
+        run: node xstoria.js
+      - name: Salva risultati
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: out-storia
+          path: out-storia/
