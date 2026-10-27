@@ -139,23 +139,25 @@ async function storia(tok, nome) {
 function simula(m, serie, cand) {
   const { v, tick, qc, minSize } = cand;
   let cassa = 0, pos = 0, premio = 0, esec = 0, minutiQuotati = 0, peggior = 0;
-  let netti = 0;   // ordini eseguiti netti: +1 per ogni acquisto di YES, -1 per ogni acquisto di NO (ognuno impegna CAPITALE/2 $)
+  // quantita' FISSA per ordine (azioni), decisa col prezzo di partenza: come farebbe un bot vero.
+  // Prima la quantita' era ricalcolata a ogni minuto (50 $ / prezzo): a prezzi bassi diventava enorme e falsava tutto.
+  const N = cand.n;
   for (let i = 0; i + 1 < serie.length; i++) {
     const [t0, p] = serie[i], [t1, pDopo] = serie[i + 1];
     const dtMin = Math.min(60, Math.max(0, (t1 - t0) / 60));
     if (!(p > 0.02 && p < 0.98) || dtMin <= 0) continue;
     const bid = Math.round((Math.ceil(p / tick - 1e-9) * tick - tick) * 10000) / 10000;     // compro YES
     const ask = Math.round((Math.floor(p / tick + 1e-9) * tick + tick) * 10000) / 10000;    // vendo YES (= compro NO)
-    const nB = (CFG.CAPITALE / 2) / bid, nA = (CFG.CAPITALE / 2) / (1 - ask);
-    const attB = netti < CFG.MAX_POS && nB >= minSize, attA = netti > -CFG.MAX_POS && nA >= minSize;
+    const nB = N, nA = N;
+    const attB = pos + N <= CFG.MAX_POS * N + 1e-9 && N >= minSize, attA = pos - N >= -CFG.MAX_POS * N - 1e-9 && N >= minSize;
     // premio per questo intervallo
     const qo = qmin(attB ? S(v, (p - bid) * 100) * nB : 0, attA ? S(v, (ask - p) * 100) * nA : 0, p);
     const rate = premioIn(m, t0 * 1000);
     if (qo > 0 && rate > 0) { premio += rate * (dtMin / 1440) * (qo / (qc + qo)); minutiQuotati += dtMin; }
     // esecuzioni: il prezzo del minuto dopo attraversa l'ordine
     // il prezzo storico e' un prezzo medio: conta come esecuzione solo se lo supera di mezzo tick
-    if (attB && pDopo <= bid - tick / 2) { cassa -= bid * nB; pos += nB; esec++; netti++; }
-    if (attA && pDopo >= ask + tick / 2) { cassa += ask * nA; pos -= nA; esec++; netti--; }
+    if (attB && pDopo <= bid - tick / 2) { cassa -= bid * nB; pos += nB; esec++; }
+    if (attA && pDopo >= ask + tick / 2) { cassa += ask * nA; pos -= nA; esec++; }
     const valore = cassa + pos * pDopo;
     if (valore < peggior) peggior = valore;
   }
@@ -192,7 +194,7 @@ async function main() {
     // stima veloce del premio per ordinare i candidati
     const qo = qmin(S(v, 1) * (CFG.CAPITALE / 2) / medio, S(v, 1) * (CFG.CAPITALE / 2) / (1 - medio), medio);
     const stima = premioIn(m, Date.now()) * qo / (qc + qo);
-    cand.push({ m, v, tick: bY.tick || 0.01, qc, minSize, medio, giorni, stima });
+    cand.push({ m, v, tick: bY.tick || 0.01, qc, minSize, medio, giorni, stima, n });
   }
   cand.sort((a, b) => b.stima - a.stima);
   const scelti = cand.slice(0, CFG.CANDIDATI);
